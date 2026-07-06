@@ -1,0 +1,56 @@
+# Build the QuickJS WASM guest for quickjs-worker-go. Run from the project root:
+#
+#   docker build -f guest/Dockerfile.build -t qjs-guest-go guest/
+#   docker run --rm qjs-guest-go cat /quickjs_guest.wasm > agent/quickjs_guest.wasm
+#
+# This guest exposes a single generic `env.host_call` import (no hardcoded tools).
+
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang-18 lld-18 wasi-libc libclang-rt-18-dev-wasm32 dpkg-dev \
+    && ln -sf /usr/bin/clang-18 /usr/bin/wasm-clang \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /deps
+RUN sed -i 's/^Types: deb/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources && \
+    apt-get update && \
+    apt-get source quickjs && \
+    mv quickjs-*/ quickjs && \
+    ls quickjs/quickjs.c
+
+COPY guest.c /out/guest.c
+WORKDIR /out
+
+RUN QJS=/deps/quickjs && \
+    SYSROOT=$(dpkg -L wasi-libc | grep -m1 '/include$' | sed 's|/include$||') && \
+    echo "Sysroot: $SYSROOT" && \
+    wasm-clang \
+      --target=wasm32-wasi \
+      --sysroot="$SYSROOT" \
+      -O2 -flto \
+      -DCONFIG_VERSION=\"2024\" \
+      -DEMSCRIPTEN \
+      -DFE_DOWNWARD=0x400 \
+      -DFE_UPWARD=0x800 \
+      -D_WASI_EMULATED_SIGNAL \
+      -D_WASI_EMULATED_PROCESS_CLOCKS \
+      -I$QJS \
+      -Wno-implicit-function-declaration \
+      -Wno-incompatible-function-pointer-types \
+      -Wl,--no-entry \
+      -Wl,--export-dynamic \
+      -Wl,--allow-undefined \
+      -Wl,--lto-O2 \
+      -Wl,-z,stack-size=4194304 \
+      -mexec-model=reactor \
+      -o /quickjs_guest.wasm \
+      /out/guest.c \
+      $QJS/quickjs.c \
+      $QJS/libunicode.c \
+      $QJS/libregexp.c \
+      $QJS/cutils.c \
+    && echo "SUCCESS: $(wc -c < /quickjs_guest.wasm) bytes"
+
+CMD ["cat", "/quickjs_guest.wasm"]

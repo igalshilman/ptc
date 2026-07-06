@@ -1,0 +1,12 @@
+# Built binaries
+/bin/
+
+# Local env / secrets
+.env
+
+# OS / editor cruft
+.DS_Store
+
+# NOTE: agent/quickjs_guest.wasm is intentionally COMMITTED — it's a prebuilt
+# artifact (see `make guest`) so `go build` works without the C/Docker toolchain.
+# Do NOT ignore it.
