@@ -31,12 +31,10 @@ quickjs-worker-go/          project root — run all `go` commands here
 │   ├── loop.go             RunAgent (the Go loop) + Model/Decision/Conversation/Turn + BuildSystemPrompt
 │   ├── tool.go             Tool, NewTool (leaf→Future) / NewSeqTool (sequence); Future[R] + Run/Call/CallObject/Timer/Awakeable helpers; reflected arg+result schemas
 │   ├── service.go          Config, Service, NewService, Definitions; Ask/History/Reset; execTool (AgentTools/Exec); restateInvoker (unified Wait driver); openAIModel
-│   ├── quickjs_guest.wasm  the embedded guest (~1 MB, built from guest/)
+│   ├── quickjs_guest.wasm  the embedded guest (~656 KB, built from guest-rs/)
 │   ├── agent_test.go       in-package tests + test doubles (~20 tests)
 │   └── bench_test.go       instantiate/round/parallel benchmarks (the pool-decision evidence)
-├── guest-rs/               ACTIVE guest: Rust/rquickjs → wasm32-wasip1 (`make guest-rs`)
-├── guest/                  legacy C guest + Dockerfile.build (superseded by guest-rs)
-└── spike/rquickjs-guest/   the original feasibility spike (kept for its README notes)
+└── guest-rs/               the QuickJS guest: Rust/rquickjs → wasm32-wasip1 (`make guest-rs`)
 ```
 
 - **Entry command:** `go run ./cmd/agent` (the module root is NOT runnable — no `main` there).
@@ -60,9 +58,9 @@ go build ./...                              # builds agent + cmd/agent
 go test ./...                               # agent package tests (engine/sandbox/loop/determinism/parallel/sessions)
 OPENAI_API_KEY=sk-...  go run ./cmd/agent   # serves the "Agent" Virtual Object on :9080
 ```
-There's also a `Makefile` (`make help` lists targets: build/test/vet/fmt/tidy/run/guest).
+There's also a `Makefile` (`make help` lists targets: build/test/vet/fmt/tidy/run/guest-rs).
 `agent/quickjs_guest.wasm` is a COMMITTED prebuilt artifact (so `go build` needs
-only Go); rebuild it with `make guest` after editing `guest/guest.c`.
+only Go); rebuild it with `make guest-rs` after editing `guest-rs/`.
 
 Env vars: `AGENT_ADDR` (default `:9080`), `AGENT_MODEL` (default `gpt-5`; the
 project's key also has gpt-5-mini/nano/gpt-5.1/gpt-5.2 — gpt-5 works via plain
@@ -83,9 +81,9 @@ curl -X POST http://localhost:8080/Agent/s1/History   # transcript (empty body �
 curl -X POST http://localhost:8080/Agent/s1/Reset     # clear the session
 ```
 
-### Rebuild the QuickJS guest (only if you edit guest/guest.c)
+### Rebuild the QuickJS guest (only if you edit guest-rs/)
 ```bash
-make guest      # docker build + extract wasm to agent/quickjs_guest.wasm (needs Docker)
+make guest-rs   # cargo build (wasm32-wasip1) + copy to agent/quickjs_guest.wasm
 ```
 
 ### Sandbox gotchas (Claude Code environment)
@@ -233,10 +231,9 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
 - **The whole design was adversarially audited** (a 4-dimension review + verify
   pass); all confirmed findings are fixed (infinite-retry, runaway hang, memory
   cap, self-correction, tool-JSON validation, pending overflow).
-- **Guest rewritten in Rust (`guest-rs/`, rquickjs) and instances are pooled.** The
-  active guest is now `guest-rs/` (`rquickjs` → `wasm32-wasip1`, ~656 KB vs the 976 KB
-  C guest); the C guest in `guest/` is superseded but kept for reference. Both share
-  the exact same ABI, and the ENTIRE offline suite passes against the Rust guest.
+- **Guest is Rust (`guest-rs/`, rquickjs) and instances are pooled.** The guest is
+  `guest-rs/` (`rquickjs` → `wasm32-wasip1`, ~656 KB); it replaced an earlier C guest
+  (~976 KB) with the same ABI — the ENTIRE offline suite passes against it.
   Pooling (reuse with exclusive checkout + fresh `JSContext` per run) cut per-round
   allocation **~10 MB → ~82 KB (≈120×)** — measured in `bench_test.go`; latency is
   unchanged in practice (~1 ms, ≪ the LLM call). This was done to kill GC churn under

@@ -1,11 +1,11 @@
 //! QuickJS WASM guest (Rust / rquickjs) — async JS executor with ONE generic
-//! `host_call` import. A drop-in replacement for the C guest (`../guest/guest.c`):
-//! identical ABI and status codes, driven by the same wazero host in `../agent`.
+//! `host_call` import. Driven by the wazero host in `../agent`; the ABI and status
+//! codes below are the contract that `../agent/engine.go` + `guest.go` depend on.
 //!
 //! Built for REUSE: a persistent `Runtime` with a FRESH `Context` per `eval_code`
 //! (so a pooled instance can't leak globals between programs), a growable `Vec`
-//! pending list (no fixed cap), and a full reset each run. `Vec` + RAII remove the
-//! manual malloc/free/JSValue bookkeeping (and the leak class) of the C guest.
+//! pending list (no fixed cap), and a full reset each run. `Vec` + RAII keep the
+//! promise/handle bookkeeping leak-free.
 //!
 //! Determinism (clock/rand) is NOT here — the host injects it in the JS prelude, so
 //! it survives instance reuse (see agent/sandbox.go determinismPrelude).

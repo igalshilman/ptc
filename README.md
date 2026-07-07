@@ -1,151 +1,135 @@
 # quickjs-worker-go — a durable CodeAct AI agent
 
-A Restate durable-execution agent built on the **CodeAct** pattern:
+A Restate durable-execution agent on the **CodeAct** pattern: each round the LLM
+writes a small **JavaScript program** that calls developer-registered Go **tools**;
+the program runs in an embedded **QuickJS** interpreter (Rust/`rquickjs` → WASM,
+driven by wazero), and every model call and tool call is a durable, journaled
+Restate step — so the agent survives crashes and replays deterministically.
+
+Built on **Go + wazero (WASM) + QuickJS (rquickjs) + restatedev/sdk-go + OpenAI**.
+`cmd/agent` is the entry point; `agent/` is the reusable engine. See `CLAUDE.md` for
+the full map and invariants, and `DESIGN.md` for the tool-abstraction rationale.
+
+## How it works
 
 - The agent is a **Virtual Object**: each object key is an independent, durable
-  **session** whose conversation transcript is persisted as object state, so it
-  remembers across calls. Session API: `Ask {"message":...}` (drive a turn),
-  `History {}` (read-only shared handler → transcript), `Reset {}` (clear).
-- The **agent loop runs in Go** (a plain loop, NOT a `restate.Run`), inside the
-  `Ask` handler.
-- Each round the model **always writes a JavaScript program** (a mini workflow)
-  that manipulates the tools. The **LLM call is the only durable `restate.Run`**
-  in the loop.
-- The generated **program runs in QuickJS** and calls **tools the developer
-  registered in Go**. Each tool call **traps back into Go** and runs as its own
-  durable `restate.Run` — so once a tool succeeds its result is deterministically
-  captured and never re-run on replay. Tools hold a live `restate.Context`
-  (durable timers, service calls, state, …); to the JS program each is just a
-  plain async function — nothing about Restate is visible.
-- Each tool carries a **JSON Schema** for its argument, surfaced to the model in
-  the system prompt. Two tool styles:
-  - **`NewTool[Args]`** — a *context tool* that holds the live `restate.Context`
-    (durable timers, service calls, state). Runs sequentially within a batch.
-  - **`NewRunTool[Args]`** — a *run tool* whose body is one durable step (HTTP,
-    compute). The agent wraps it in `restate.RunAsync`, so a `Promise.all` over
-    run-tools executes **durably in parallel**.
-  Both reflect their arg schema from a Go struct (via `invopop/jsonschema`).
-- The program signals completion by returning `{done:true, answer}`; any other
-  return value is fed back as an **observation** and the model writes the next
-  program — so the loop self-corrects until it finishes or hits a round budget.
+  **session** whose transcript is persisted as object state. Handlers:
+  `Ask {"message":...}` (drive a turn), `History {}` (shared read-only → transcript),
+  `Reset {}` (clear).
+- The **agent loop runs in Go** (a plain loop, NOT a `restate.Run`) inside `Ask`.
+  Each round the model returns `{thought, code}`; the durable step is the model
+  call. The `code` runs in QuickJS and ends by returning `{done:true, answer}` to
+  finish, or any other value which is fed back as an observation for the next round
+  (self-correction until it finishes or hits a round budget).
+- The program calls **tools the developer registered in Go**. To the JS program
+  each tool is a plain async function — nothing about Restate is visible.
 
 ```
- Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.Run)
-   each round:
-     ├─ model.Decide ── restate.Run ─▶ OpenAI ─▶ Decision{ code }        (durable step)
-     └─ Sandbox.RunProgram(code) ─▶ QuickJS (wazero) runs the program
-             │  await calc(...) / await http_get(...)      ← plain async JS
-             └─ traps to Go ─▶ tool.Handler(restate.Context) ── restate.Run ─▶ side effect   (durable step)
-        program returns {done:true, answer}  → loop ends
-        program returns anything else        → observation → next round
+Agent/<session>/Ask  →  RunAgent loop (plain Go, NOT a restate.Run)
+  each round:
+    ├─ model.Decide ── restate.Run ─▶ OpenAI ─▶ {code}                 (durable step)
+    └─ Sandbox.RunProgram(code) ─▶ QuickJS runs the program
+         await Promise.all([a(x), b(y)])            ← plain async JS, one batch
+         └─ host_call ─▶ InvokeBatch: each call becomes a durable Future
+              (leaf = in-process Run/Call/Timer │ seq = AgentTools/Exec sub-invocation)
+              ─▶ one restate.Wait drives them in parallel              (durable steps)
+       returns {done:true, answer} → done │ else → observation → next round
 ```
 
-> **No hardcoded tools.** The guest (`guest/guest.c`) exposes a single generic
-> bridge — `__hostCall(name, argJSON)` over the `env.host_call` import — and the
-> sandbox prelude defines each registered tool as a plain JS function on top of
-> it. The guest hardcodes no tool names, so the only callable functions are the
-> ones the developer registers.
+## Tools — one type, plus a sequence escape hatch
 
-## Project layout
+Every tool auto-reflects its argument **and** result JSON Schema (via
+`invopop/jsonschema`), both surfaced to the model. The model can't tell the two
+kinds apart; they differ only in how their durable Future is produced.
 
-**Entry point: `cmd/agent`** — that's the one `main`. Infra vs. user code is split:
+- **`NewTool[A, R](name, desc, func(restate.Context, A) (agent.Future[R], error))`**
+  — a *leaf* tool: its body performs ONE non-blocking submission and returns the
+  `Future`, built via `agent.Run` (side effect), `agent.Call`/`agent.CallObject`
+  (service call), `agent.Timer` (durable timer), or `agent.Awakeable`. A
+  `Promise.all` of leaf tools runs durably **in parallel**, in-process.
+- **`NewSeqTool[A, R](name, desc, func(restate.Context, A) (R, error))`** — a
+  *sequence* tool: an ordinary blocking, multi-step handler (service calls, timers,
+  awakeables, data-dependent steps). It runs in its own `AgentTools/Exec`
+  **sub-invocation**, so it may orchestrate freely and still parallelize with
+  sibling tools — at the cost of one invocation hop.
 
-```
-cmd/agent/            package main — THE entry point (user code)
-  main.go               setup() wires client+tools+loop; main() binds the handler & serves
-  tools.go              the developer's durable tools (compute / http_get / wait)
-agent/                package agent — the reusable durable-CodeAct engine (infra)
-  engine.go             wazero driver for the guest; registers the single env.host_call import
-  guest.go              cached guest exports + memory helpers
-  wasm.go               //go:embed quickjs_guest.wasm
-  sandbox.go            runs one JS program; tool prelude over __hostCall; Invoker/BatchInvoker
-  loop.go               RunAgent (the Go loop) + Model/Decision/Conversation + BuildSystemPrompt
-  tool.go               Tool, NewTool, NewRunTool (typed handlers + reflected JSON Schema)
-  service.go            Config, Service, NewService, Definition; the Ask/History/Reset handlers,
-                        restateInvoker (durable dispatch), openAIModel (durable model call)
-  quickjs_guest.wasm    the embedded guest
-guest/                guest.c + Dockerfile.build (C source; not a Go package)
-```
-
-The user writes tools + `setup()`; everything else is the reusable `agent` package.
-`Config`/`NewService`/`Service.Definition` is the whole public surface `cmd/agent` uses.
+Concurrency contract: `InvokeBatch` submits every call in a batch, drives them with
+one `restate.Wait`, and reads results by index — so `Promise.all` parallelizes and
+sequential `await`s serialize, deterministically. See `DESIGN.md` for the "why".
 
 ## Run
+
 ```bash
 OPENAI_API_KEY=sk-...  go run ./cmd/agent      # serves the Agent Virtual Object on :9080
-go test ./...                                  # engine, sandbox, loop, determinism, parallelism, sessions
+go test ./...                                  # engine, sandbox, loop, determinism, pooling, sessions
 ```
 
-## Sessions (multi-turn memory)
-The `Ask(session, message)` handler loads the session transcript from state
-(`restate.Get`), runs the loop continuing from prior context, and persists it
-back (`restate.Set`) on success — so follow-ups like "add 1 to that" build on the
-previous answer. State is not written on failure, so a failed turn leaves the
-session unchanged. `History` (a shared read-only handler) returns the transcript
-and `Reset` clears it.
+Env: `AGENT_MODEL` (default `gpt-5`), `AGENT_ADDR` (default `:9080`),
+`OPENAI_BASE_URL` (any OpenAI-compatible endpoint), `OPENAI_API_KEY` (required;
+`setup()` exits at boot if unset — use `dummy` for a keyless local endpoint).
 
-## Run against a real Restate runtime
-The deps + `replace github.com/restatedev/sdk-go => ../../sdk-go` are already in
-`go.mod`. Start the agent and Restate, then register:
-```
-OPENAI_API_KEY=sk-... go run ./cmd/agent          # serves on :9080
+### Against a real Restate runtime
+```bash
+OPENAI_API_KEY=sk-... go run ./cmd/agent                       # :9080
 docker run -d --name restate -p 8080:8080 -p 9070:9070 \
   --add-host=host.docker.internal:host-gateway restatedev/restate:latest
 curl -X POST http://localhost:9070/deployments \
   -H content-type:application/json -d '{"uri":"http://host.docker.internal:9080"}'
+# talk to a session (object key = session id):
+curl http://localhost:8080/Agent/s1/Ask -H content-type:application/json -d '{"message":"what is 6 times 7?"}'
+curl -X POST http://localhost:8080/Agent/s1/History     # transcript (empty body — Void input)
+curl -X POST http://localhost:8080/Agent/s1/Reset       # clear the session
 ```
-Talk to a session (object key = session id):
+> Verified live (Docker + OpenAI gpt-5): compute via a leaf tool; a `delayed_fetch`
+> seq tool running as its own sub-invocation; parallel tools; multi-turn session
+> memory; and idempotent replay (a repeated `Idempotency-Key` runs the model once).
+
+## The guest
+
+The QuickJS guest is Rust/`rquickjs` compiled to `wasm32-wasip1` (`guest-rs/`),
+embedded via `//go:embed` as a COMMITTED artifact so `go build` needs only the Go
+toolchain. Rebuild it with `make guest-rs`. It's Restate-agnostic: it exposes ONE
+generic bridge — `__hostCall(name, argJSON)` over the `env.host_call` import — and
+the sandbox prelude defines each registered tool on top of it, so the guest
+hardcodes no tool names; the only callable functions are the ones you register.
+
+## Layout
+
 ```
-curl http://localhost:8080/Agent/sess1/Ask -H content-type:application/json -d '{"message":"..."}'
-curl -X POST http://localhost:8080/Agent/sess1/History   # transcript (empty body — Void input)
-curl -X POST http://localhost:8080/Agent/sess1/Reset     # clear the session
+cmd/agent/            package main — THE entry point (user code)
+  main.go               setup() wires client+tools+loop; main() binds handlers & serves
+  tools.go              the developer's tools (compute / http_get / wait / delayed_fetch)
+agent/                package agent — the reusable durable-CodeAct engine (infra)
+  engine.go             wazero driver + instance pool; the single env.host_call import
+  guest.go              cached guest exports + linear-memory helpers
+  wasm.go               //go:embed quickjs_guest.wasm
+  sandbox.go            runs one JS program; tool prelude + JS-level determinism prelude
+  loop.go               RunAgent (the Go loop) + Model/Decision + BuildSystemPrompt
+  tool.go               Tool, NewTool (leaf → Future), NewSeqTool; Future + Run/Call/Timer/… helpers
+  service.go            Config/Service/NewService/Definitions; Ask/History/Reset; restateInvoker; openAIModel
+  quickjs_guest.wasm    the embedded guest (committed)
+guest-rs/             the QuickJS guest — Rust/rquickjs → wasm32-wasip1
 ```
-Set `OPENAI_BASE_URL` to point at any OpenAI-compatible endpoint; `AGENT_MODEL`
-(default `gpt-4o-mini`) and `AGENT_ADDR` (default `:9080`) are also configurable.
 
-> Verified live (Docker + real OpenAI): `Ask{"message":"multiply 21 by 2"}` → `{"answer":"42"}`;
-> the model self-corrects on a bad program; history persists across invocations;
-> a repeated `Idempotency-Key` runs the model once.
+## Durability, determinism, safety
 
-## Durability contract
-On crash/replay the handler re-runs the Go loop from the top; each round's
-`restate.Run` (the model call) and each tool's `restate.Run`/`restate.Sleep`
-return their **journaled** values instead of re-executing, so the agent resumes
-deterministically. Each program runs in a fresh QuickJS instance (no JS state
-shared across rounds — state flows via observations).
+- **Replay:** on crash/replay the handler re-runs the Go loop from the top; each
+  journaled model call and tool call returns its captured value instead of
+  re-executing. Deterministic give-ups (`ErrMaxRounds`) are surfaced as *terminal*
+  errors so Restate never retries them forever; session state is persisted only on
+  success.
+- **Determinism:** because a program is re-run verbatim on replay, its clock and
+  randomness are frozen in the JS prelude (the `Date` constructor, `Date.now`,
+  `Math.random`, and `crypto`) — done at the JS level so it survives guest-instance
+  reuse; the WASI clock/rand are pinned to constants as a backstop. The seed comes
+  from `restate.Rand(ctx)` and the clock is captured once in a journaled step.
+- **Pooling:** guest instances are reused (EXCLUSIVE checkout + a FRESH `JSContext`
+  per run for cross-session isolation), cutting per-round allocation ~10 MB → ~82 KB.
+  `Engine.Close` drains in-flight runs before shutting the runtime down.
+- **Safety:** per-program wall-clock timeout (`WithCloseOnContextDone` +
+  `SetProgramTimeout`); a 256 MiB memory cap (wazero + `JS_SetMemoryLimit`); the
+  pending-call list grows (no arbitrary cap) with a high graceful ceiling; malformed
+  model output and tool errors are fed back as observations rather than being fatal.
 
-### Determinism
-Because a program is re-run verbatim on replay, its randomness and clock are
-frozen to replay-stable values, so a program that does `Math.random()` /
-`Date.now()` / `new Date()` to compute a tool argument produces the same argument
-on every replay (no journal divergence):
-- `Math.random` and `Date.now` are overridden in the sandbox prelude (seeded LCG
-  + frozen clock);
-- the WASI clock and random source are also frozen at the wazero level, so
-  `new Date()` is stable too;
-- in production the seed comes from `restate.Rand(ctx)` and the clock is captured
-  once in a journaled `restate.Run` — both identical across replays.
-
-### Robustness & safety (from an adversarial audit)
-- **No infinite retries.** Deterministic give-ups (round-budget exhaustion →
-  `ErrMaxRounds`) are surfaced as *terminal* errors by `Ask`, so Restate never
-  retries a run that would just re-fail identically on replay.
-- **Runaway-program guard.** The runtime is built with `WithCloseOnContextDone`
-  and each program runs under a wall-clock budget (`SetProgramTimeout`), so a
-  model-generated `while(true){}` is interrupted and reported (fed back to the
-  model) instead of pinning a goroutine forever.
-- **Memory cap.** Each guest instance is capped at `maxMemoryPages` (256 MiB) via
-  wazero, a backstop against an allocate-until-OOM program.
-- **Self-correction.** A malformed model decision (non-JSON / prose-wrapped) is
-  leniently parsed and, if still bad, fed back as an observation (`ErrBadDecision`)
-  rather than killing the run; an empty program is likewise fed back; a
-  `{done:true}` with no usable answer is not accepted as completion.
-- **Clear tool errors.** A tool returning invalid JSON produces a tool-named
-  error, not an opaque JS parse rejection.
-
-- **Concurrent-call cap.** The guest caps in-flight calls at `MAX_PENDING`
-  (4096); on overflow — or when the host refuses a call — it **rejects the
-  promise with a clear error** rather than stranding it, so a huge `Promise.all`
-  fails cleanly instead of hanging. The guest also sets `JS_SetMemoryLimit`
-  (256 MiB) and `JS_SetMaxStackSize`, backing the wazero-level memory cap inside
-  the interpreter.
+The design was adversarially reviewed; `CLAUDE.md` records the invariants and the
+known limitations.

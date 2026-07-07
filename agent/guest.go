@@ -48,9 +48,9 @@ func newGuest(mod api.Module) *guest {
 	}
 }
 
-// call1 invokes a guest export returning a single scalar. Wasm traps are fatal
-// in this spike, so we surface them loudly rather than threading errors through
-// every call site.
+// call1 invokes a guest export returning a single scalar. A wasm trap panics here
+// and is recovered into an error in Engine.Run, rather than threading errors
+// through every call site.
 func call1(ctx context.Context, fn api.Function, args ...uint64) uint64 {
 	res, err := fn.Call(ctx, args...)
 	if err != nil {

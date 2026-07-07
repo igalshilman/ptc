@@ -1,17 +1,15 @@
-// Package main embeds the QuickJS WASM guest (quickjs-guest/guest.c) and drives
-// it from Go using wazero.
+// engine.go drives the embedded QuickJS WASM guest (built from guest-rs/) via
+// wazero.
 //
-// The guest is Restate-agnostic: it exposes an async-JS executor over a small
-// ABI (eval_code / run_microtasks / resolve_handle / get_pending_handles /
-// get_result_*) and imports host functions (webSearch/bash/catalog/summaries/
-// sleep) that each return an integer handle. The host owns the event loop:
-// evaluate -> collect pending host calls -> resolve them -> drain microtasks ->
-// repeat, exactly like the Rust quickjs-worker but on wazero instead of wasmtime.
+// The guest is Restate-agnostic: it exposes an async-JS executor over a small ABI
+// (eval_code / run_microtasks / resolve_handle / get_pending_* / get_result_* /
+// guest_alloc) and imports ONE generic host function — env.host_call(name, arg),
+// returning an integer handle. The host owns the event loop: evaluate -> collect
+// pending host calls -> resolve them -> drain microtasks -> repeat.
 //
-// In this spike the pending calls are resolved by a mock Resolver. In the real
-// worker the Resolver will map each call onto a durable Restate operation
-// (restate.Run for tool/OpenAI calls, restate.Sleep for sleep) so results are
-// journaled and replayed.
+// The Resolver maps each pending call onto a durable Restate operation (see
+// restateInvoker in service.go); guest instances are pooled and reused across runs
+// (acquire/release), reset by each eval_code.
 package agent
 
 import (
@@ -55,7 +53,7 @@ func (r *lcgReader) Read(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Guest status codes — must match quickjs-guest/guest.c.
+// Guest status codes — must match guest-rs/src/lib.rs.
 const (
 	statusDone       int32 = 0
 	statusHasPending int32 = 1
@@ -80,8 +78,9 @@ type HostResult struct {
 	IsError bool
 }
 
-// Resolver turns a batch of pending host calls into results. The spike uses a
-// mock; the durable worker will call restate.Run / restate.Sleep here.
+// Resolver turns a batch of pending host calls into results. In production this is
+// restateInvoker (service.go), which runs each call as a durable Restate step; the
+// tests use in-memory doubles.
 type Resolver interface {
 	Resolve(ctx context.Context, calls []HostCall) []HostResult
 }
@@ -126,7 +125,7 @@ func stateFrom(ctx context.Context) *runState {
 type Engine struct {
 	runtime       wazero.Runtime
 	compiled      wazero.CompiledModule
-	hasInitialize bool        // guest is a WASI reactor (C guest) vs a plain cdylib (Rust guest)
+	hasInitialize bool        // guest is a WASI reactor (exports _initialize) vs a plain cdylib
 	free          chan *guest // idle, reset-ready instances available for reuse
 
 	mu       sync.Mutex     // guards closing; serializes it against inflight.Add
@@ -192,8 +191,9 @@ func NewEngine(ctx context.Context, wasm []byte) (*Engine, error) {
 		_ = r.Close(ctx)
 		return nil, fmt.Errorf("compile guest: %w", err)
 	}
-	// The C guest is a WASI reactor (exports `_initialize`, which must run before
-	// other exports); the Rust cdylib guest has none (Rust inits statics lazily).
+	// A reactor guest exports `_initialize` (must run before other exports); our
+	// Rust cdylib guest has none (Rust inits statics lazily), so this is false —
+	// the check keeps the driver correct if a reactor guest is ever swapped in.
 	_, hasInit := compiled.ExportedFunctions()["_initialize"]
 	return &Engine{
 		runtime:       r,

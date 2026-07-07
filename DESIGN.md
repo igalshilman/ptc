@@ -97,5 +97,5 @@ yields in completion order but we **discard** that and read results by index.
   awaited in a *later* agent round (the loop would serialize/rehydrate the handle).
   Separable feature; not the core tool abstraction.
 - **Structured tool errors.** Deliver `{code,message,terminal}` to JS via a prelude
-  `.catch` (no guest.c change needed — `resolve_handle` already sets the string as
+  `.catch` (no guest change needed — `resolve_handle` already sets the string as
   `err.message`).
