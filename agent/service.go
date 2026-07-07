@@ -13,11 +13,10 @@ import (
 
 // Config configures a durable agent Service.
 type Config struct {
-	Client        openai.Client // an OpenAI(-compatible) client
-	Model         string        // model id (default "gpt-4o-mini")
-	Tools         []Tool        // developer tools exposed to the agent
-	MaxRounds     int           // loop budget per message (default 10)
-	ProgramBudget time.Duration // per-program wall-clock cap (default 60s)
+	Client    openai.Client // an OpenAI(-compatible) client
+	Model     string        // model id (default "gpt-4o-mini")
+	Tools     []Tool        // developer tools exposed to the agent
+	MaxRounds int           // loop budget per message (default 10)
 }
 
 // Service is a durable CodeAct agent exposed as a Restate Virtual Object: each
@@ -25,13 +24,12 @@ type Config struct {
 // QuickJS engine and the tool set are fixed at construction and shared across
 // sessions/invocations.
 type Service struct {
-	engine        *Engine
-	client        openai.Client
-	model         string
-	tools         []Tool
-	toolByName    map[string]Tool // for the AgentTools/Exec dispatch (seq tools)
-	maxRounds     int
-	programBudget time.Duration
+	engine     *Engine
+	client     openai.Client
+	model      string
+	tools      []Tool
+	toolByName map[string]Tool // for the AgentTools/Exec dispatch (seq tools)
+	maxRounds  int
 }
 
 // Names of the companion service that runs seq tools as their own sub-invocations.
@@ -54,22 +52,17 @@ func NewService(ctx context.Context, cfg Config) (*Service, error) {
 	if rounds == 0 {
 		rounds = 10
 	}
-	budget := cfg.ProgramBudget
-	if budget == 0 {
-		budget = 60 * time.Second
-	}
 	byName := make(map[string]Tool, len(cfg.Tools))
 	for _, t := range cfg.Tools {
 		byName[t.Name] = t
 	}
 	return &Service{
-		engine:        eng,
-		client:        cfg.Client,
-		model:         model,
-		tools:         cfg.Tools,
-		toolByName:    byName,
-		maxRounds:     rounds,
-		programBudget: budget,
+		engine:     eng,
+		client:     cfg.Client,
+		model:      model,
+		tools:      cfg.Tools,
+		toolByName: byName,
+		maxRounds:  rounds,
 	}, nil
 }
 
@@ -155,7 +148,6 @@ func (s *Service) Ask(ctx restate.ObjectContext, in AskInput) (AskOutput, error)
 		return AskOutput{}, err
 	}
 	sb.SetDeterminism(restate.Rand(ctx).Int64(), now) // math/rand/v2: Int64, not Int63
-	sb.SetProgramTimeout(s.programBudget)
 
 	model := &openAIModel{rctx: ctx, client: s.client, model: s.model, system: BuildSystemPrompt(toolSpecs(s.tools))}
 

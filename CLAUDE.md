@@ -7,7 +7,8 @@ Go "tools"; every model call and tool call is a durable, journaled step in
 deterministically. Built on **Go + wazero (WASM) + QuickJS + restatedev/sdk-go +
 OpenAI**.
 
-Module: `quickjsworker` (Go 1.25). This directory is the project root (`go.mod` is here).
+Module: `restatedev` (Go 1.25) — the core library imports as `restatedev/agent`. This
+directory is the project root (`go.mod` is here).
 
 ---
 

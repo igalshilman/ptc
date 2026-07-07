@@ -702,15 +702,13 @@ func TestThrowingMicrotaskContained(t *testing.T) {
 	}
 }
 
-// TestProgramTimeout: a runaway program is interrupted by the per-program budget
-// and surfaces as a time-limit error (not a hung goroutine).
-func TestProgramTimeout(t *testing.T) {
-	eng, ctx := newTestEngine(t)
-	sb := NewSandbox(eng, &testInvoker{})
-	sb.SetProgramTimeout(500 * time.Millisecond)
-	_, err := sb.RunProgram(ctx, `while (true) {}`)
-	if err == nil || !strings.Contains(err.Error(), "time limit") {
-		t.Fatalf("expected time-limit error, got %v", err)
+// TestPrettyJS: the log pretty-printer re-indents by bracket depth and is
+// string-aware — brackets inside a string literal must not skew the indentation.
+func TestPrettyJS(t *testing.T) {
+	in := "const a = await x({k:\"}{\"});\nif (a) {\nreturn {done:true, answer: a};\n}"
+	want := "const a = await x({k:\"}{\"});\nif (a) {\n  return {done:true, answer: a};\n}"
+	if got := prettyJS(in); got != want {
+		t.Fatalf("prettyJS mismatch:\n got: %q\nwant: %q", got, want)
 	}
 }
 

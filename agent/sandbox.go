@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
 )
 
 // ToolSpec describes a tool to the model: its name, a human description, and the
@@ -56,7 +55,6 @@ type Sandbox struct {
 	seed      int64
 	nowMillis int64
 	callSeq   int
-	timeout   time.Duration // per-program wall-clock budget; 0 = unbounded
 }
 
 // NewSandbox binds an engine to an invoker.
@@ -69,12 +67,6 @@ func (s *Sandbox) SetDeterminism(seed, nowMillis int64) {
 	s.seed = seed
 	s.nowMillis = nowMillis
 }
-
-// SetProgramTimeout bounds a single program's wall-clock execution. On timeout
-// the guest is interrupted and RunProgram returns an error (fed back to the
-// model). 0 disables it. Note the budget spans any tool waits the program does,
-// so pick a value comfortably above expected tool latency.
-func (s *Sandbox) SetProgramTimeout(d time.Duration) { s.timeout = d }
 
 // Tools exposes the registered tool specs (used to build the model prompt).
 func (s *Sandbox) Tools() []ToolSpec { return s.inv.Tools() }
@@ -89,12 +81,6 @@ func (s *Sandbox) Tools() []ToolSpec { return s.inv.Tools() }
 // frontier and the program blocks, so the round returns the frontier for the host to
 // run durably. This keeps the guest stateless — no live, suspended program.
 func (s *Sandbox) RunProgram(ctx context.Context, program string) (string, error) {
-	if s.timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, s.timeout)
-		defer cancel()
-	}
-
 	seq := s.callSeq
 	s.callSeq++
 	// ONE seed per program, reused across every re-execution of it, so the program's

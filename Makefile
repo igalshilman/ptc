@@ -26,13 +26,13 @@ vet: ## Run go vet
 	go vet ./...
 
 fmt: ## Format sources
-	gofmt -w agent cmd
+	gofmt -w agent examples
 
 tidy: ## Tidy go.mod/go.sum
 	go mod tidy
 
-run: ## Run the agent (needs OPENAI_API_KEY; serves :9080)
-	go run ./cmd/agent
+run: ## Run the research example (needs OPENAI_API_KEY; serves :9080)
+	go run ./examples/research
 
 guest-rs: ## Rebuild $(GUEST_WASM) from guest-rs/ (Rust/rquickjs → wasm32-wasip1)
 	cd guest-rs && cargo build --release --target wasm32-wasip1

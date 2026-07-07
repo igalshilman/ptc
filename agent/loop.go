@@ -73,6 +73,7 @@ func BuildSystemPrompt(specs []ToolSpec) string {
 	b.WriteString("A single program may chain several tool calls. Example code:\n")
 	b.WriteString("    const r = await someTool({key: \"value\"});\n")
 	b.WriteString("    return {done: true, answer: r.value};\n")
+	b.WriteString("Always prefer to run the tools in parallel using Promise.all/allSettled/race/any structure your programs for concurrency\n")
 	b.WriteString("Tool results are captured durably, so retries never repeat a completed tool call.\n\n")
 	if len(specs) == 0 {
 		b.WriteString("No tools are available.")
@@ -188,7 +189,7 @@ func RunAgent(ctx context.Context, sb *Sandbox, model Model, convo *Conversation
 			continue
 		}
 
-		logf("round %d: running generated program (%d bytes)", round, len(dec.Code))
+		logf("round %d: running program (%d bytes):\n  %s", round, len(dec.Code), strings.ReplaceAll(prettyJS(dec.Code), "\n", "\n  "))
 		result, runErr := sb.RunProgram(ctx, dec.Code)
 		convo.Turns = append(convo.Turns, Turn{Role: RoleAssistant, Content: dec.Code})
 
@@ -239,4 +240,89 @@ func finalAnswer(result string) (string, bool) {
 		return s, true // answer was a JSON string — return it unquoted
 	}
 	return string(pr.Answer), true // answer was an object/array/number
+}
+
+// prettyJS re-indents a JavaScript program for readable logging: it keeps the model's
+// line breaks but recomputes each line's indentation from bracket depth, so a program
+// prints as a clean, consistently-indented block regardless of how the model spaced
+// it. It is string/comment-aware (brackets inside '…', "…", `…`, // …, and /* … */ are
+// ignored) but intentionally simple — it does NOT reflow single-line code onto several
+// lines, and it can mis-indent around regex literals (rare in agent programs).
+func prettyJS(src string) string {
+	const unit = "  "
+	lines := strings.Split(strings.ReplaceAll(src, "\r\n", "\n"), "\n")
+	var b strings.Builder
+	depth := 0
+	inBlockComment := false
+	for i, raw := range lines {
+		line := strings.TrimSpace(raw)
+		lead, net, stillInBlock := scanBrackets(line, inBlockComment)
+		indent := depth - lead
+		if indent < 0 {
+			indent = 0
+		}
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		if line != "" {
+			b.WriteString(strings.Repeat(unit, indent))
+			b.WriteString(line)
+		}
+		if depth += net; depth < 0 {
+			depth = 0
+		}
+		inBlockComment = stillInBlock
+	}
+	return b.String()
+}
+
+// scanBrackets counts, over one trimmed line, the leading run of closing brackets
+// (lead — used to dedent a line that starts by closing a block) and the net change in
+// bracket depth (net), skipping anything inside strings and comments. inBlock carries
+// /* … */ state across lines.
+func scanBrackets(line string, inBlock bool) (lead, net int, stillInBlock bool) {
+	stillInBlock = inBlock
+	leadCounting := !inBlock
+	var quote byte // 0, or the open string delimiter ' " `
+	esc := false
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		switch {
+		case stillInBlock:
+			if c == '*' && i+1 < len(line) && line[i+1] == '/' {
+				stillInBlock = false
+				i++
+			}
+			leadCounting = false
+		case quote != 0:
+			if esc {
+				esc = false
+			} else if c == '\\' {
+				esc = true
+			} else if c == quote {
+				quote = 0
+			}
+			leadCounting = false
+		case c == '/' && i+1 < len(line) && line[i+1] == '/':
+			return lead, net, stillInBlock // line comment: nothing after it counts
+		case c == '/' && i+1 < len(line) && line[i+1] == '*':
+			stillInBlock = true
+			i++
+			leadCounting = false
+		case c == '"' || c == '\'' || c == '`':
+			quote = c
+			leadCounting = false
+		case c == '{' || c == '[' || c == '(':
+			net++
+			leadCounting = false
+		case c == '}' || c == ']' || c == ')':
+			net--
+			if leadCounting {
+				lead++
+			}
+		default:
+			leadCounting = false
+		}
+	}
+	return lead, net, stillInBlock
 }

@@ -79,7 +79,9 @@ type frontierCall struct {
 }
 
 // maxProgramRounds bounds the re-execution loop (a program making this many
-// sequential tool calls is pathological); the per-program timeout is the real guard.
+// sequential tool calls is pathological). Nothing bounds wall-clock time WITHIN a
+// single execute; WithCloseOnContextDone only lets an invocation cancellation
+// interrupt a stuck guest.
 const maxProgramRounds = 4096
 
 // fatalError signals that execution must ABORT with this error rather than be fed
@@ -221,7 +223,7 @@ func (e *Engine) release(ctx context.Context, g *guest, healthy bool) {
 // script for a round (injecting the journal of results so far); `resolve` runs a
 // frontier of tool calls durably and returns their results (to append to the
 // journal). It returns the program's answer (JSON), or a program error to feed back
-// to the model. A guest trap / timeout / Restate cancellation is recovered here.
+// to the model. A guest trap or Restate cancellation is recovered here.
 func (e *Engine) Run(
 	ctx context.Context,
 	assemble func(journal []ToolResult) string,
@@ -246,7 +248,7 @@ func (e *Engine) Run(
 				err = v.err
 			default:
 				if ce := ctx.Err(); ce != nil {
-					err = fmt.Errorf("program exceeded its time limit: %w", ce)
+					err = fmt.Errorf("program interrupted: %w", ce)
 				} else {
 					err = fmt.Errorf("guest execution failed: %v", r)
 				}

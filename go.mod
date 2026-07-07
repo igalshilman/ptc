@@ -1,4 +1,4 @@
-module quickjsworker
+module restatedev
 
 go 1.25.0
 
