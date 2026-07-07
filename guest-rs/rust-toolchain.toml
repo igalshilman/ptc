@@ -1,0 +1,5 @@
+# Pin the guest's own toolchain + wasm target so `make guest-rs` builds regardless
+# of any repo-root rust-toolchain.toml. `targets` auto-installs the wasm target.
+[toolchain]
+channel = "stable"
+targets = ["wasm32-wasip1"]
