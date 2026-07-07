@@ -660,8 +660,9 @@ func TestSession(t *testing.T) {
 }
 
 // TestPoolReuseIsolation: when an instance is reused from the pool, one program's
-// global pollution must NOT be visible to the next (fresh JSContext per run). This
-// is the correctness/security property pooling depends on.
+// global pollution must NOT be visible to the next. The guest is stateless — a fresh
+// QuickJS runtime per execute call — so isolation is inherent; this guards the
+// correctness/security property pooling depends on.
 func TestPoolReuseIsolation(t *testing.T) {
 	eng, ctx := newTestEngine(t)
 	sb := NewSandbox(eng, &testInvoker{})

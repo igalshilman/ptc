@@ -24,10 +24,10 @@ quickjs-worker-go/          project root — run all `go` commands here
 │   ├── main.go             setup() wires client+tools+loop; main() binds services & serves
 │   └── tools.go            the developer's durable tools (compute / http_get / wait / delayed_fetch)
 ├── agent/                  package agent — reusable durable-CodeAct engine (INFRA)
-│   ├── engine.go           wazero driver; registers the single `env.host_call` import; determinism
-│   ├── guest.go            cached guest export handles + linear-memory helpers
+│   ├── engine.go           wazero driver + instance pool + the re-execution loop (NO host import); determinism pin
+│   ├── guest.go            cached guest exports (guest_alloc/dealloc/execute) + linear-memory helpers
 │   ├── wasm.go             //go:embed quickjs_guest.wasm
-│   ├── sandbox.go          runs one JS program; tool prelude over __hostCall; Invoker/BatchInvoker
+│   ├── sandbox.go          assembles each round's script (determinism + journal + tool bridge + program) from JS raw-string constants; Invoker
 │   ├── loop.go             RunAgent (the Go loop) + Model/Decision/Conversation/Turn + BuildSystemPrompt
 │   ├── tool.go             Tool, NewTool (leaf→Future) / NewSeqTool (sequence); Future[R] + Run/Call/CallObject/Timer/Awakeable helpers; reflected arg+result schemas
 │   ├── service.go          Config, Service, NewService, Definitions; Ask/History/Reset; execTool (AgentTools/Exec); restateInvoker (unified Wait driver); openAIModel
@@ -104,11 +104,15 @@ If the shell runs sandboxed:
 Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.Run)
   each round:
     ├─ model.Decide ── restate.Run ─▶ OpenAI ─▶ Decision{ code }        (durable step)
-    └─ Sandbox.RunProgram(code) ─▶ QuickJS (wazero) runs the program
-            │  await Promise.all([toolA(x), toolB(y)])  ← plain async JS; one batch
-            └─ traps to Go (env.host_call) ─▶ InvokeBatch: submit each as a durable
-                 Future (leaf = in-process Run/Call/Timer │ seq = RequestFuture to
+    └─ Sandbox.RunProgram(code) ─▶ engine RE-EXECUTES the program each sub-round:
+            │  execute(assemble(journal)) ─▶ QuickJS runs the program from the top;
+            │    journaled tool calls return their recorded result; the first NEW
+            │    call(s) form the FRONTIER, then the program blocks and returns
+            │  await Promise.all([toolA(x), toolB(y)])  ← plain async JS; one frontier
+            └─ InvokeBatch(frontier): submit each as a durable Future
+                 (leaf = in-process Run/Call/Timer │ seq = RequestFuture to
                  AgentTools/Exec) ─▶ one restate.Wait drives them in PARALLEL   (durable steps)
+                 ─▶ append results to the journal, re-execute
        program returns {done:true, answer}  → loop ends
        program returns anything else        → observation → next round
 ```
@@ -116,16 +120,30 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
 - **The loop is Go** (`RunAgent` in loop.go), running directly inside the `Ask`
   handler — it is NOT wrapped in `restate.Run`.
 - **The only durable steps** are (1) each model call (in `openAIModel.Decide`) and
-  (2) each tool call. Running the JS program is pure recomputation, re-run on replay.
+  (2) each tool call. Running the JS program is pure recomputation — it is re-executed
+  both across Restate replays AND, within a single turn, once per frontier round (the
+  re-execution model, below).
 - **The model always emits a JS program** as `{"thought","code"}`. The program
   (an async function body — write statements directly, do NOT wrap in a `function`)
   ends by returning `{done:true, answer}` to finish, or any other value which is
   fed back as an observation for the next round (self-correction).
-- **Generic guest ABI (no hardcoded tools):** the guest exposes ONE import
-  `env.host_call(name, arg)` and one JS global `__hostCall(name, argJSON)`. The
-  sandbox prelude defines each registered tool as a JS function over `__hostCall`.
-  (Earlier versions hijacked a fixed `webSearch` import as a transport — that hack
-  is gone.)
+- **Re-execution model (why the guest has no host import and no globals):** the guest
+  is a STATELESS one-shot evaluator — `execute(script) -> outputBlob`, with NO wasm
+  import. It never calls back into Go and keeps nothing between calls (a fresh QuickJS
+  runtime per call, dropped at the end). Instead of a live, suspended program, the host
+  RE-EXECUTES the program from the top each round (`Engine.Run`'s loop), injecting a
+  `globalThis.__journal` of the tool results so far. The pure-JS `__hostCall` bridge
+  (`bridgeJS` in sandbox.go) matches each call BY ORDER against the journal: a known
+  call resolves with its recorded result, a NEW call is pushed to
+  `globalThis.__frontier` and returns a never-resolving promise so the program blocks.
+  The guest then returns `{s:0,answer}` (done), `{s:1,frontier}` (run these calls), or
+  `{s:2,error}`. This mirrors Restate's own handler replay, one level down. Because the
+  program is deterministic, its call sequence is identical every round, so
+  journal-by-index matching is sound.
+- **Generic tools (no hardcoded names):** the sandbox prelude defines each registered
+  tool as a plain async JS function over `__hostCall`; the guest hardcodes no tool
+  names. (Earlier versions hijacked a fixed `webSearch` import as a transport, and an
+  intermediate live-guest design used an `env.host_call` import — both are gone.)
 - **One tool type, minted two ways** (`agent.NewTool` / `agent.NewSeqTool`). The
   model can't tell them apart; the difference is only *how the future is produced*,
   and the batch driver treats every future identically. The design rationale (why
@@ -156,11 +174,15 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
 
 ## Invariants to preserve (don't regress these)
 
-- **Determinism / replay:** a program is re-run verbatim on replay, so its clock &
-  randomness are frozen (sandbox.go overrides `Math.random`/`Date.now`; engine.go
-  freezes the WASI clock/rand via wazero `WithWalltime`/`WithRandSource`). In
-  production the seed = `restate.Rand(ctx).Int64()` and the clock is captured once
-  in a journaled `restate.Run`. `TestReplayDeterminism` guards this.
+- **Determinism / replay:** a program is re-run verbatim — both on Restate replay AND
+  on every frontier round of the re-execution loop — so its clock & randomness MUST be
+  frozen (sandbox.go's `detPreludeJS` overrides `Math.random`, the `Date` constructor,
+  `Date.now`, `crypto`, `performance.now`; engine.go pins the WASI clock/rand via wazero
+  `WithWalltime`/`WithRandSource` as a backstop). ONE seed is minted per program and
+  reused across all its re-executions, so its tool-call sequence is identical every
+  round — which is what makes journal-by-index matching sound. In production the seed =
+  `restate.Rand(ctx).Int64()` and the clock is captured once in a journaled
+  `restate.Run`. `TestReplayDeterminism` / `TestDeterminism` guard this.
 - **Parallel tools:** `restateInvoker.InvokeBatch` must SUBMIT every call first
   (each `submit` is non-blocking — a leaf `Run`/`Call`/`Timer` or a seq
   `RequestFuture` to `AgentTools/Exec`), THEN drive them all with one `restate.Wait`,
@@ -181,15 +203,16 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
   from a pool (`Engine.free`), not instantiated per Run — this removed ~10 MB/Run of
   allocation churn (now ~82 KB/Run). The guest is single-threaded and NOT reentrant,
   so reuse is safe ONLY because each instance is checked out by exactly one Run at a
-  time (`acquire`/`release`): never hand one instance to two goroutines. Two things
-  make reuse correct: (1) the guest resets on every `eval_code` — a FRESH `JSContext`
-  per run, so one program's globals/prototype edits can't leak into the next
-  (`TestPoolReuseIsolation` guards this); (2) the host `guest_dealloc`s its per-run
-  buffers so they don't accumulate. An instance is RETIRED (not returned to the pool)
-  if the Run trapped/timed out, served `maxRunsPerInstance`, or grew past
+  time (`acquire`/`release`): never hand one instance to two goroutines
+  (`TestConcurrentRunsAreIsolated`, run with `-race`, guards this). Reuse needs NO
+  reset because the guest is STATELESS — `execute` creates and drops a fresh QuickJS
+  runtime per call, so nothing leaks between programs OR between the re-execution
+  rounds of one program (`TestPoolReuseIsolation`); the host `guest_dealloc`s its
+  per-run buffers so they don't accumulate. An instance is RETIRED (not returned to the
+  pool) if the Run trapped/timed out, served `maxRunsPerInstance`, or grew past
   `instanceMemHighWater`. New instances are instantiated with `context.Background()`
   so their lifetime isn't tied to a Run's (cancellable) ctx; only the guest CALLS
-  carry the per-Run ctx (timeout + `runState`).
+  carry the per-Run ctx (timeout + cancellation).
 - **No infinite retries:** deterministic give-ups (`ErrMaxRounds`) are returned as
   *terminal* errors by `Ask` (`restate.ToTerminalError`). A non-terminal error
   would make Restate retry the same deterministic failure forever.
@@ -198,11 +221,14 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
 - **Safety:** wazero runtime built with `WithCloseOnContextDone(true)` +
   `WithMemoryLimitPages` (256 MiB); per-program timeout via `Sandbox.SetProgramTimeout`
   (a runaway `while(true)` is interrupted → error fed back). The guest also sets
-  `JS_SetMemoryLimit`/`JS_SetMaxStackSize`. Its pending-promise list GROWS on demand
-  (no arbitrary cap on legitimate `Promise.all` fan-out) with a high safety ceiling
-  `PENDING_MAX` (2^20) that rejects cleanly, and it frees promise capabilities on
-  reset (reuse-safe). Guest traps are recovered into errors in `Engine.Run` (call1
-  panics → recover → error), never crashing the goroutine.
+  `set_memory_limit` (256 MiB) / `set_max_stack_size` (2 MiB) on its runtime. The
+  frontier is an ordinary JS array with no arbitrary cap on legitimate `Promise.all`
+  fan-out (`TestLargeFrontier` runs a 5000-call frontier); the re-execution loop is
+  bounded by `maxProgramRounds` (4096 sequential rounds) as a backstop. Guest traps are
+  recovered into errors in `Engine.Run` (call1 panics → recover → error), never crashing
+  the goroutine. QuickJS is compiled with `NDEBUG` (guest-rs/.cargo/config.toml) so its
+  teardown sweep frees the arena instead of tripping a debug refcount assert on an
+  unhandled throwing microtask (`TestThrowingMicrotaskContained`).
 - **math/rand/v2:** `restate.Rand(ctx)` returns a `*math/rand/v2.Rand` → use
   `.Int64()`, NOT `.Int63()`.
 - **Model context is bounded** (loop.go): each observation is clipped to
@@ -223,33 +249,39 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
 
 ## Status & known limitations
 
-- **Verified end-to-end live** (Docker + real OpenAI `gpt-4o-mini`): the model
-  reasons, self-corrects on a bad program, calls durable tools (`compute` local,
-  `http_get` real network), persists session history, and a repeated
-  `Idempotency-Key` runs the model once. All ~18 offline tests pass; `go vet ./...`
-  clean; gofmt clean.
+- **Verified end-to-end live** (Docker + real OpenAI `gpt-5`): the model reasons,
+  self-corrects on a bad program, calls durable tools (`compute` local, `http_get` real
+  network, a `delayed_fetch` seq tool as its own sub-invocation), runs parallel tools,
+  persists session history, and a repeated `Idempotency-Key` runs the model once.
+  NOTE: that live run predated the re-execution rewrite (same external behavior, new
+  internal model); the re-execution build passes the full offline suite (~29 tests,
+  incl. `-race`), `go vet ./...`, and gofmt clean, but has not been re-verified live.
 - **The whole design was adversarially audited** (a 4-dimension review + verify
   pass); all confirmed findings are fixed (infinite-retry, runaway hang, memory
   cap, self-correction, tool-JSON validation, pending overflow).
 - **Guest is Rust (`guest-rs/`, rquickjs) and instances are pooled.** The guest is
-  `guest-rs/` (`rquickjs` → `wasm32-wasip1`, ~656 KB); it replaced an earlier C guest
-  (~976 KB) with the same ABI — the ENTIRE offline suite passes against it.
-  Pooling (reuse with exclusive checkout + fresh `JSContext` per run) cut per-round
-  allocation **~10 MB → ~82 KB (≈120×)** — measured in `bench_test.go`; latency is
-  unchanged in practice (~1 ms, ≪ the LLM call). This was done to kill GC churn under
-  concurrent sessions, which the benchmark had flagged as the one real pooling driver.
-- **The Rust guest + pool were adversarially reviewed** (5 dimensions + verify). Fixed:
-  (1) the microtask drain now continues past a throwing job, so leftover jobs can't
-  run against the next pooled run's freed context (a use-after-free — the job queue
-  lives on the persistent Runtime); (2) the `Date` freeze is no longer escapable via
-  `.constructor`; (3) `lcgReader` is non-mutating (WASI rand stays reuse-stable);
-  (4) `guest_alloc(0)` no longer leaks. Guarded by `TestPoolReuseAfterThrowingMicrotask`
-  / `TestDateFreezeNotEscapableViaConstructor` / `TestPoolReuseIsolation`. Known
-  remaining gap (pre-existing, not pooling-specific): `Engine.Close` doesn't drain
-  in-flight Runs — part of the "no graceful shutdown" limitation.
+  `guest-rs/` (`rquickjs` → `wasm32-wasip1`, ~656 KB); it replaced an earlier C guest.
+  Its ABI is now a single stateless `execute(script) -> {s:0 answer | s:1 frontier |
+  s:2 error}` export (plus `guest_alloc`/`guest_dealloc`), with NO host import — the
+  re-execution model (see "How it works"). Pooling (reuse with exclusive checkout) cut
+  per-round allocation **~10 MB → ~82 KB (≈120×)** — measured in `bench_test.go`;
+  latency is unchanged in practice (~1 ms, ≪ the LLM call). Pooling was done to kill GC
+  churn under concurrent sessions, which the benchmark had flagged as the one real driver.
+- **The Rust guest was adversarially reviewed** (multiple dimensions + verify). Fixed:
+  (1) the `Date` freeze is no longer escapable via `.constructor`
+  (`TestDateFreezeNotEscapableViaConstructor`); (2) `lcgReader` is non-mutating (WASI
+  rand stays reuse-stable); (3) `guest_alloc(0)` no longer leaks; (4) the microtask
+  drain continues past a throwing job so the queue fully drains before the runtime is
+  dropped (`TestThrowingMicrotaskContained`). The intermediate live-guest design's
+  cross-run use-after-free (a job queue on a persistent Runtime) is gone by
+  construction — the re-execution guest drops its runtime after every call.
+- **Graceful shutdown:** `Engine.Close` stops accepting new Runs and waits (bounded by
+  ctx) for in-flight Runs before closing the runtime, so it can't close an instance
+  under an active guest call (`TestGracefulShutdownWaitsForInflight`).
 - **`compute` tool** uses a toy `evalSimple` (single `a*b`/`a+b` only) — it's a
   demo tool; replace with real capabilities.
-- **Not committed to git** yet (was untracked in the sdk-embedded repo).
+- **Committed** on the `rust-guest-and-pooling` feature branch (the re-execution
+  rewrite is `aa28bc4`); not pushed.
 
 ## Dependencies (all published; no replace)
 - `github.com/restatedev/sdk-go v1.0.0` (Restate Go SDK)

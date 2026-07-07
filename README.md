@@ -28,11 +28,12 @@ the full map and invariants, and `DESIGN.md` for the tool-abstraction rationale.
 Agent/<session>/Ask  →  RunAgent loop (plain Go, NOT a restate.Run)
   each round:
     ├─ model.Decide ── restate.Run ─▶ OpenAI ─▶ {code}                 (durable step)
-    └─ Sandbox.RunProgram(code) ─▶ QuickJS runs the program
-         await Promise.all([a(x), b(y)])            ← plain async JS, one batch
-         └─ host_call ─▶ InvokeBatch: each call becomes a durable Future
+    └─ Sandbox.RunProgram(code) ─▶ engine RE-EXECUTES the program each round
+         await Promise.all([a(x), b(y)])            ← plain async JS, one frontier
+         └─ frontier ─▶ InvokeBatch: each call becomes a durable Future
               (leaf = in-process Run/Call/Timer │ seq = AgentTools/Exec sub-invocation)
               ─▶ one restate.Wait drives them in parallel              (durable steps)
+              ─▶ append results to the journal, re-execute until the program settles
        returns {done:true, answer} → done │ else → observation → next round
 ```
 
@@ -88,10 +89,18 @@ curl -X POST http://localhost:8080/Agent/s1/Reset       # clear the session
 
 The QuickJS guest is Rust/`rquickjs` compiled to `wasm32-wasip1` (`guest-rs/`),
 embedded via `//go:embed` as a COMMITTED artifact so `go build` needs only the Go
-toolchain. Rebuild it with `make guest-rs`. It's Restate-agnostic: it exposes ONE
-generic bridge — `__hostCall(name, argJSON)` over the `env.host_call` import — and
-the sandbox prelude defines each registered tool on top of it, so the guest
-hardcodes no tool names; the only callable functions are the ones you register.
+toolchain. Rebuild it with `make guest-rs`.
+
+It's a **stateless one-shot evaluator** with NO host import: `execute(script)` runs an
+assembled script to synchronous quiescence and returns `{s:0 answer | s:1 frontier |
+s:2 error}` — it never calls back into Go and keeps nothing between calls. Instead of a
+live, suspended program, the host **re-executes** the program from the top each round,
+injecting a journal of the tool results so far as `globalThis.__journal`. The pure-JS
+`__hostCall` bridge replays that journal by call order and collects any NEW call into a
+frontier (the durable parallel batch); the sandbox prelude defines each registered tool
+as an async function over it, so the guest hardcodes no tool names — the only callable
+functions are the ones you register. QuickJS is built with `NDEBUG` so its teardown
+sweep doesn't trip a debug refcount assert.
 
 ## Layout
 
@@ -100,7 +109,7 @@ cmd/agent/            package main — THE entry point (user code)
   main.go               setup() wires client+tools+loop; main() binds handlers & serves
   tools.go              the developer's tools (compute / http_get / wait / delayed_fetch)
 agent/                package agent — the reusable durable-CodeAct engine (infra)
-  engine.go             wazero driver + instance pool; the single env.host_call import
+  engine.go             wazero driver + instance pool + the re-execution loop (no host import)
   guest.go              cached guest exports + linear-memory helpers
   wasm.go               //go:embed quickjs_guest.wasm
   sandbox.go            runs one JS program; tool prelude + JS-level determinism prelude
@@ -118,18 +127,23 @@ guest-rs/             the QuickJS guest — Rust/rquickjs → wasm32-wasip1
   re-executing. Deterministic give-ups (`ErrMaxRounds`) are surfaced as *terminal*
   errors so Restate never retries them forever; session state is persisted only on
   success.
-- **Determinism:** because a program is re-run verbatim on replay, its clock and
-  randomness are frozen in the JS prelude (the `Date` constructor, `Date.now`,
-  `Math.random`, and `crypto`) — done at the JS level so it survives guest-instance
-  reuse; the WASI clock/rand are pinned to constants as a backstop. The seed comes
-  from `restate.Rand(ctx)` and the clock is captured once in a journaled step.
-- **Pooling:** guest instances are reused (EXCLUSIVE checkout + a FRESH `JSContext`
-  per run for cross-session isolation), cutting per-round allocation ~10 MB → ~82 KB.
-  `Engine.Close` drains in-flight runs before shutting the runtime down.
+- **Determinism:** a program is re-run verbatim — on replay AND on every re-execution
+  round — so its clock and randomness are frozen in the JS prelude (the `Date`
+  constructor, `Date.now`, `Math.random`, `crypto`); the WASI clock/rand are pinned to
+  constants as a backstop. ONE seed is minted per program and reused across all its
+  re-executions, so its tool-call sequence is identical every round — that's what makes
+  matching the journal by index sound. The seed comes from `restate.Rand(ctx)` and the
+  clock is captured once in a journaled step.
+- **Pooling:** guest instances are reused (EXCLUSIVE checkout — one Run per instance at
+  a time), cutting per-round allocation ~10 MB → ~82 KB. Reuse needs no reset: the
+  guest is stateless (a fresh QuickJS runtime per `execute` call), so nothing leaks
+  between programs. `Engine.Close` drains in-flight runs before shutting the runtime down.
 - **Safety:** per-program wall-clock timeout (`WithCloseOnContextDone` +
-  `SetProgramTimeout`); a 256 MiB memory cap (wazero + `JS_SetMemoryLimit`); the
-  pending-call list grows (no arbitrary cap) with a high graceful ceiling; malformed
-  model output and tool errors are fed back as observations rather than being fatal.
+  `SetProgramTimeout`); a 256 MiB memory cap (wazero + the guest's own
+  `set_memory_limit`/`set_max_stack_size`); the frontier is a plain JS array with no
+  arbitrary fan-out cap, and the re-execution loop is bounded by `maxProgramRounds`;
+  malformed model output and tool errors are fed back as observations rather than being
+  fatal.
 
 The design was adversarially reviewed; `CLAUDE.md` records the invariants and the
 known limitations.

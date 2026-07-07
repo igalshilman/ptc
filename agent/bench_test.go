@@ -41,7 +41,7 @@ func BenchmarkInstantiateOnly(b *testing.B) {
 }
 
 // BenchmarkRunProgramTrivial: the FULL per-round guest cost — instantiate +
-// JS_NewRuntime/JS_NewContext (lazy in eval_code) + eval a trivial program +
+// a fresh QuickJS runtime/context (created inside execute) + eval a trivial program +
 // close. This is what actually happens each agent round, minus the LLM call.
 func BenchmarkRunProgramTrivial(b *testing.B) {
 	eng, ctx := benchEngine(b)

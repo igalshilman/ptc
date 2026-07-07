@@ -13,11 +13,12 @@ functions. A program can fire several tools concurrently:
 const [a, b] = await Promise.all([toolA(x), toolB(y)]);
 ```
 
-Both `__hostCall`s become pending in **one batch** before Go runs either (this is
-just microtask-quiescence, not special to `Promise.all` — `const p=a(); const q=b();
+Both `__hostCall`s land in the **frontier** as one batch before Go runs either (this
+is just microtask-quiescence, not special to `Promise.all` — `const p=a(); const q=b();
 await p; await q;` batches identically). So the batch already encodes the model's
 concurrency intent. The question is only: *how does Go execute a batch, durably and
-replay-safely?*
+replay-safely?* (The frontier is how the re-execution engine surfaces that batch — see
+`CLAUDE.md`; this document is about how Go then runs it.)
 
 ## The load-bearing constraint
 
@@ -97,5 +98,5 @@ yields in completion order but we **discard** that and read results by index.
   awaited in a *later* agent round (the loop would serialize/rehydrate the handle).
   Separable feature; not the core tool abstraction.
 - **Structured tool errors.** Deliver `{code,message,terminal}` to JS via a prelude
-  `.catch` (no guest change needed — `resolve_handle` already sets the string as
-  `err.message`).
+  `.catch` (no guest change needed — the journal replay in `bridgeJS` already rejects
+  with the error string as `err.message`).
