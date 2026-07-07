@@ -1,0 +1,9 @@
+# rquickjs-sys compiles QuickJS (via the cc crate) with debug assertions ON even in
+# release. A debug-only refcount assertion (gc_decref_child: p->ref_count > 0) can
+# abort during runtime teardown on some paths (e.g. an unhandled throwing
+# microtask). Build QuickJS with NDEBUG — the way production QuickJS runs — so its
+# final teardown sweep frees the arena instead of asserting. Scoped to guest-rs, so
+# both `make guest-rs` and a plain `cargo build` here pick it up.
+[env]
+CFLAGS_wasm32_wasip1 = "-DNDEBUG"
+TARGET_CFLAGS = "-DNDEBUG"

@@ -14,13 +14,6 @@ import (
 	restate "github.com/restatedev/sdk-go"
 )
 
-// resolverFunc adapts a func to the Resolver interface for engine-level tests.
-type resolverFunc func(ctx context.Context, calls []HostCall) []HostResult
-
-func (f resolverFunc) Resolve(ctx context.Context, calls []HostCall) []HostResult {
-	return f(ctx, calls)
-}
-
 func newTestEngine(t *testing.T) (*Engine, context.Context) {
 	t.Helper()
 	ctx := context.Background()
@@ -32,18 +25,17 @@ func newTestEngine(t *testing.T) (*Engine, context.Context) {
 	return eng, ctx
 }
 
-func TestEngineSync(t *testing.T) {
+// TestEvalAndReturn: a tool-free program runs to completion in one round (no
+// frontier) and RunProgram returns its value as JSON.
+func TestEvalAndReturn(t *testing.T) {
 	eng, ctx := newTestEngine(t)
-	never := resolverFunc(func(_ context.Context, _ []HostCall) []HostResult {
-		t.Fatal("resolver should not be called for sync code")
-		return nil
-	})
 	for _, tc := range []struct{ name, code, want string }{
-		{"string", `return "hi";`, "hi"},
-		{"json", `return JSON.stringify({a:1,b:2});`, `{"a":1,"b":2}`},
+		{"json_object", `return {a:1,b:2};`, `{"a":1,"b":2}`},
+		{"string", `return "hi";`, `"hi"`},
+		{"number", `return 6*7;`, `42`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := eng.Run(ctx, tc.code, never)
+			got, err := NewSandbox(eng, &testInvoker{}).RunProgram(ctx, tc.code)
 			if err != nil {
 				t.Fatalf("run: %v", err)
 			}
@@ -54,62 +46,52 @@ func TestEngineSync(t *testing.T) {
 	}
 }
 
-func TestEnginePromiseAll(t *testing.T) {
+// TestPromiseAllFrontier: a Promise.all of two tools is collected as one frontier
+// and both resolve; the results feed back on re-execution.
+func TestPromiseAllFrontier(t *testing.T) {
 	eng, ctx := newTestEngine(t)
-	res := resolverFunc(func(_ context.Context, calls []HostCall) []HostResult {
-		if len(calls) != 2 {
-			t.Fatalf("expected 2 pending calls (Promise.all), got %d", len(calls))
-		}
-		out := make([]HostResult, len(calls))
-		for i, c := range calls {
-			out[i] = HostResult{Handle: c.Handle, Value: "got:" + c.Arg}
-		}
-		return out
+	inv := &testInvoker{}
+	inv.add("echo", func(_ context.Context, arg json.RawMessage) (json.RawMessage, error) {
+		return json.RawMessage(fmt.Sprintf(`{"v":%s}`, arg)), nil // arg is a JSON value
 	})
-	got, err := eng.Run(ctx, `const [a,b]=await Promise.all([__hostCall("search","x"),__hostCall("search","y")]); return a+"|"+b;`, res)
+	got, err := NewSandbox(eng, inv).RunProgram(ctx,
+		`const [a,b] = await Promise.all([echo("x"), echo("y")]); return a.v + "|" + b.v;`)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if got != "got:x|got:y" {
-		t.Fatalf("got %q", got)
+	if got != `"x|y"` {
+		t.Fatalf("got %q, want \"x|y\"", got)
 	}
 }
 
-// TestEngineManyPendingGrows: a Promise.all of 5000 concurrent host calls — well
-// past the old fixed MAX_PENDING (4096) — must all be tracked (the pending list
-// grows) and resolve, rather than the excess being rejected.
-func TestEngineManyPendingGrows(t *testing.T) {
+// TestLargeFrontier: a Promise.all of 5000 tool calls is collected as one frontier
+// (a plain JS array — no fixed cap) and all resolve.
+func TestLargeFrontier(t *testing.T) {
 	eng, ctx := newTestEngine(t)
 	const n = 5000
-	res := resolverFunc(func(_ context.Context, calls []HostCall) []HostResult {
-		if len(calls) != n {
-			t.Fatalf("expected one batch of %d pending calls, got %d", n, len(calls))
-		}
-		out := make([]HostResult, len(calls))
-		for i, c := range calls {
-			out[i] = HostResult{Handle: c.Handle, Value: c.Arg} // echo the numeric arg
-		}
-		return out
+	inv := &testInvoker{}
+	inv.add("echo", func(_ context.Context, arg json.RawMessage) (json.RawMessage, error) {
+		return json.RawMessage(fmt.Sprintf(`{"v":%s}`, arg)), nil // arg is a number
 	})
 	code := fmt.Sprintf(`
 		const ps = [];
-		for (let i = 0; i < %d; i++) ps.push(__hostCall("echo", String(i)));
+		for (let i = 0; i < %d; i++) ps.push(echo(i));
 		const r = await Promise.all(ps);
-		let sum = 0; for (const x of r) sum += Number(x);
-		return String(sum);`, n)
-	got, err := eng.Run(ctx, code, res)
+		let sum = 0; for (const x of r) sum += x.v;
+		return sum;`, n)
+	got, err := NewSandbox(eng, inv).RunProgram(ctx, code)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	if want := fmt.Sprintf("%d", n*(n-1)/2); got != want {
-		t.Fatalf("got %q, want %q (all %d calls must resolve, not just the first 4096)", got, want, n)
+		t.Fatalf("got %q, want %q (all %d calls must resolve)", got, want, n)
 	}
 }
 
-func TestEngineThrow(t *testing.T) {
+// TestProgramThrow: a thrown error surfaces as a non-nil RunProgram error.
+func TestProgramThrow(t *testing.T) {
 	eng, ctx := newTestEngine(t)
-	never := resolverFunc(func(_ context.Context, _ []HostCall) []HostResult { return nil })
-	_, err := eng.Run(ctx, `throw new Error("boom");`, never)
+	_, err := NewSandbox(eng, &testInvoker{}).RunProgram(ctx, `throw new Error("boom");`)
 	if err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("want error containing boom, got %v", err)
 	}
@@ -126,19 +108,16 @@ func TestGracefulShutdownWaitsForInflight(t *testing.T) {
 	}
 	started := make(chan struct{})
 	release := make(chan struct{})
-	res := resolverFunc(func(_ context.Context, calls []HostCall) []HostResult {
-		close(started) // signal we're mid-Run (tool invoked)
+	inv := &testInvoker{}
+	inv.add("block", func(_ context.Context, _ json.RawMessage) (json.RawMessage, error) {
+		close(started) // signal we're mid-Run (tool invoked, inside engine.Run)
 		<-release      // block until the test lets go
-		out := make([]HostResult, len(calls))
-		for i, c := range calls {
-			out[i] = HostResult{Handle: c.Handle, Value: `{"v":1}`}
-		}
-		return out
+		return json.RawMessage(`{"ok":true}`), nil
 	})
 
 	runErr := make(chan error, 1)
 	go func() {
-		_, e := eng.Run(ctx, `const r = await __hostCall("t","x"); return JSON.stringify(r);`, res)
+		_, e := NewSandbox(eng, inv).RunProgram(ctx, `await block({}); return {done:true, answer:"x"};`)
 		runErr <- e
 	}()
 	<-started // the Run is in-flight, blocked inside the tool
@@ -164,7 +143,7 @@ func TestGracefulShutdownWaitsForInflight(t *testing.T) {
 		t.Fatal("Close did not return after the in-flight Run finished")
 	}
 
-	if _, e := eng.Run(ctx, `return 1;`, res); !errors.Is(e, errEngineClosed) {
+	if _, e := NewSandbox(eng, inv).RunProgram(ctx, `return 1;`); !errors.Is(e, errEngineClosed) {
 		t.Fatalf("expected errEngineClosed after Close, got %v", e)
 	}
 }
@@ -229,8 +208,13 @@ func (m *testInvoker) addWithSchema(name, desc, params string, fn func(context.C
 	m.specs = append(m.specs, spec)
 }
 func (m *testInvoker) Tools() []ToolSpec { return m.specs }
-func (m *testInvoker) Invoke(ctx context.Context, tool string, arg json.RawMessage) (json.RawMessage, error) {
-	return m.tools[tool](ctx, arg)
+func (m *testInvoker) InvokeBatch(ctx context.Context, calls []ToolCall) []ToolResult {
+	out := make([]ToolResult, len(calls))
+	for i, c := range calls {
+		v, err := m.tools[c.Tool](ctx, c.Arg)
+		out[i] = ToolResult{Value: v, Err: err}
+	}
+	return out
 }
 
 // scriptModel returns pre-scripted decisions; each step may inspect the convo.
@@ -514,9 +498,11 @@ type recordingInvoker struct {
 }
 
 func (r *recordingInvoker) Tools() []ToolSpec { return r.inner.Tools() }
-func (r *recordingInvoker) Invoke(ctx context.Context, tool string, arg json.RawMessage) (json.RawMessage, error) {
-	*r.calls = append(*r.calls, tool+"("+string(arg)+")")
-	return r.inner.Invoke(ctx, tool, arg)
+func (r *recordingInvoker) InvokeBatch(ctx context.Context, calls []ToolCall) []ToolResult {
+	for _, c := range calls {
+		*r.calls = append(*r.calls, c.Tool+"("+string(c.Arg)+")")
+	}
+	return r.inner.InvokeBatch(ctx, calls)
 }
 
 // TestReplayDeterminism is the core durability guarantee at the integration
@@ -589,7 +575,7 @@ func TestParallelTools(t *testing.T) {
 	}
 }
 
-// batchMock implements BatchInvoker and records the largest batch it saw.
+// batchMock records the largest batch (frontier) it saw.
 type batchMock struct {
 	specs    []ToolSpec
 	maxBatch int
@@ -597,9 +583,6 @@ type batchMock struct {
 }
 
 func (b *batchMock) Tools() []ToolSpec { return b.specs }
-func (b *batchMock) Invoke(_ context.Context, tool string, arg json.RawMessage) (json.RawMessage, error) {
-	return b.fn(tool, arg)
-}
 func (b *batchMock) InvokeBatch(_ context.Context, calls []ToolCall) []ToolResult {
 	if len(calls) > b.maxBatch {
 		b.maxBatch = len(calls)
@@ -612,9 +595,9 @@ func (b *batchMock) InvokeBatch(_ context.Context, calls []ToolCall) []ToolResul
 	return out
 }
 
-// TestBatchInvoker: when the Invoker implements BatchInvoker, a Promise.all of N
-// tool calls is delivered as ONE batch of N — the hook a durable invoker uses to
-// run them in parallel (restate.RunAsync). Verifies the wiring offline.
+// TestBatchInvoker: a Promise.all of N tool calls is delivered to InvokeBatch as ONE
+// frontier of N — the hook a durable invoker uses to run them in parallel
+// (restate.RunAsync). Verifies the wiring offline.
 func TestBatchInvoker(t *testing.T) {
 	eng, ctx := newTestEngine(t)
 	m := &batchMock{
@@ -697,12 +680,12 @@ func TestPoolReuseIsolation(t *testing.T) {
 	}
 }
 
-// TestPoolReuseAfterThrowingMicrotask: a program that leaves a THROWING microtask
-// queued must not corrupt the next program on the reused instance. The microtask
-// queue lives on the shared Runtime; before drain_and_status was fixed to continue
-// past a throwing job, the leftover job ran against the next run's freed context
-// (use-after-free). Program B running cleanly on the reused instance guards it.
-func TestPoolReuseAfterThrowingMicrotask(t *testing.T) {
+// TestThrowingMicrotaskContained: a program with an unhandled throwing microtask
+// must not crash the guest (the QuickJS teardown handles it — the guest is built
+// with NDEBUG), and a subsequent run on the same pooled instance must be unaffected.
+// In the re-execution model each execute uses a fresh runtime, so isolation is
+// inherent; this guards against a regression (e.g. a debug-assert abort returning).
+func TestThrowingMicrotaskContained(t *testing.T) {
 	eng, ctx := newTestEngine(t)
 	sb := NewSandbox(eng, &testInvoker{})
 	if _, err := sb.RunProgram(ctx,

@@ -193,8 +193,8 @@ func (s *Service) Reset(ctx restate.ObjectContext, _ restate.Void) (restate.Void
 // --- Invoker: dispatches JS tool calls to the registered Tools ---------------
 
 // restateInvoker binds registered tools to the current invocation's context and
-// satisfies Invoker/BatchInvoker. The context.Context passed to Invoke (carrying
-// wasm run-state) is ignored; the tool gets the real restate.Context.
+// satisfies Invoker. The context.Context passed to InvokeBatch (carrying no useful
+// state here) is ignored; the tools get the real restate.Context.
 type restateInvoker struct {
 	rctx  restate.Context
 	tools map[string]Tool
@@ -210,15 +210,7 @@ func (r *restateInvoker) Tools() []ToolSpec {
 	return specs
 }
 
-// Invoke runs a single tool call. It just delegates to InvokeBatch (a batch of
-// one), so there is one code path. In practice the Sandbox always uses the
-// BatchInvoker path; this exists to satisfy the Invoker interface.
-func (r *restateInvoker) Invoke(_ context.Context, tool string, arg json.RawMessage) (json.RawMessage, error) {
-	res := r.InvokeBatch(nil, []ToolCall{{Tool: tool, Arg: arg}})
-	return res[0].Value, res[0].Err
-}
-
-// InvokeBatch resolves a batch of tool calls with durable PARALLELISM through a
+// InvokeBatch resolves a frontier of tool calls with durable PARALLELISM through a
 // single, uniform driver: submit EVERY call as an in-flight Future (a leaf tool
 // submits in-process via Run/Call/Timer/…; a seq tool is dispatched to its own
 // AgentTools/Exec sub-invocation), then drive them all together with one

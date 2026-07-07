@@ -1,25 +1,34 @@
-//! QuickJS WASM guest (Rust / rquickjs) — an async-JS executor exposed to the Go
-//! host in `../agent` over a small C ABI. Two modules, cleanly separated:
+//! QuickJS WASM guest (Rust / rquickjs) — a **stateless, one-shot JS evaluator**.
 //!
-//!   - [`abi`]    — the cross-language boundary ONLY: the one wasm import
-//!                  (`env.host_call`) and every wasm export, plus raw linear-memory
-//!                  marshaling. No business logic; each export is a thin wrapper.
-//!   - [`engine`] — the QuickJS-driving logic: guest state, program evaluation, the
-//!                  `host_call → JS Promise → resolve-later` loop, and settlement.
+//! It exposes ONE operation: `execute(script)` runs an assembled script (built by
+//! the host in `../agent`) to synchronous quiescence and returns an output blob.
+//! There is **no host import** and **no persistent state** — the guest never calls
+//! back into the host and holds nothing between calls.
 //!
-//! # Concurrency — why `thread_local` here is not a thread-safety claim
+//! # The replay model (why there are no globals)
 //!
-//! `wasm32-wasip1` has NO threads: this module runs single-threaded. The
-//! `thread_local` in [`engine`] is therefore NOT guarding against concurrent
-//! threads — it is simply the safe, `unsafe`-free way to hold the `!Send` rquickjs
-//! handles as per-INSTANCE global state (each wazero instance has its own linear
-//! memory, hence its own copy).
+//! This mirrors Restate's own durable execution, one level down. The host does NOT
+//! keep a live, suspended program; instead it **re-executes the program from the
+//! start each round**, feeding in a *journal* of the tool results gathered so far:
 //!
-//! Safety across concurrent host requests is the HOST's responsibility, not the
-//! guest's: the Go pool checks out one wasm instance per goroutine at a time (see
-//! `agent/engine.go` `acquire`/`release`), so this state is never touched by two
-//! goroutines at once. Determinism (clock/rand) is injected by the host in JS (see
-//! `agent/sandbox.go`), so it survives instance reuse.
+//!   1. Host assembles `script` = determinism prelude + tool/journal prelude + the
+//!      program, with the journal injected as `globalThis.__journal`.
+//!   2. `execute(script)`: fresh QuickJS runtime; run the program + drain microtasks.
+//!      Each tool call the program makes is matched by ORDER to `__journal`: an
+//!      already-known call resolves immediately with its recorded result; a NEW call
+//!      is pushed to `globalThis.__frontier` and returns a promise that never
+//!      resolves this run. So the program advances to the first new call, then blocks.
+//!   3. The guest reads the JS-produced output and returns it, then drops everything.
+//!      Output is one of: `{s:0,answer}` (done), `{s:1,frontier:[{name,arg},…]}`
+//!      (needs these calls run), `{s:2,error}`.
+//!   4. Host runs the frontier durably (in parallel — the frontier IS the batch),
+//!      appends the results to the journal, and calls `execute` again.
+//!
+//! Because the program is deterministic (the host freezes clock/rand in the
+//! prelude), its tool-call sequence is identical across re-executions, so matching
+//! the journal by position is sound — exactly like Restate replaying a handler.
+//!
+//! Modules: [`abi`] = the wire (exports + raw memory); [`engine`] = the evaluator.
 
 mod abi;
 mod engine;

@@ -7,11 +7,10 @@
 # OS / editor cruft
 .DS_Store
 
-# Rust spike build artifacts (spike/*/) — source is committed, builds are not
+# Rust build artifacts — source (incl. guest-rs/.cargo/config.toml) is committed.
 target/
-.cargo/
 Cargo.lock
 
 # NOTE: agent/quickjs_guest.wasm is intentionally COMMITTED — it's a prebuilt
-# artifact (see `make guest`) so `go build` works without the C/Docker toolchain.
+# artifact (see `make guest-rs`) so `go build` works without the Rust toolchain.
 # Do NOT ignore it.

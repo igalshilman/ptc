@@ -1,30 +1,12 @@
-//! The cross-language boundary — and the ONLY place with `extern`/`#[no_mangle]`
-//! and raw linear-memory access. The single wasm import (`env.host_call`) and every
-//! wasm export live here; each export is a thin marshaling wrapper over
-//! [`crate::engine`]. Keeping the wire here means the logic in `engine` is ordinary,
-//! testable Rust with no `unsafe` FFI.
+//! The cross-language boundary — the ONLY place with `#[no_mangle]`/`extern` and
+//! raw linear-memory access. There is NO wasm import: the guest never calls back
+//! into the host. Three exports: `guest_alloc`/`guest_dealloc` (the host writes the
+//! script in and reads the output out) and `execute`.
 
 use crate::engine;
 
-// ── The one host import ─────────────────────────────────────────────────────────
-
-#[link(wasm_import_module = "env")]
-extern "C" {
-    // Registers a named host call and returns a handle (negative = refused).
-    #[link_name = "host_call"]
-    fn raw_host_call(name: *const u8, name_len: i32, arg: *const u8, arg_len: i32) -> i32;
-}
-
-/// Safe wrapper the engine calls to register a host operation.
-pub(crate) fn host_call(name: &str, arg: &str) -> i32 {
-    unsafe { raw_host_call(name.as_ptr(), name.len() as i32, arg.as_ptr(), arg.len() as i32) }
-}
-
-// ── Raw linear-memory helper ─────────────────────────────────────────────────────
-
-/// View `len` bytes at `ptr` in linear memory (empty for null/zero-length). The
-/// borrow is only used for the duration of the host call, during which the memory
-/// is stable.
+/// View `len` bytes at `ptr` in linear memory (empty for null/zero-length). Valid
+/// only for the duration of the call, during which the memory is stable.
 unsafe fn view<'a>(ptr: *const u8, len: i32) -> &'a [u8] {
     if ptr.is_null() || len <= 0 {
         &[]
@@ -33,12 +15,8 @@ unsafe fn view<'a>(ptr: *const u8, len: i32) -> &'a [u8] {
     }
 }
 
-// ── Memory management (the host allocs buffers it writes into / reads from) ──────
-
 #[no_mangle]
 pub extern "C" fn guest_alloc(size: i32) -> *mut u8 {
-    // A zero-length request gets a non-null dangling pointer (never read/written by
-    // the host), so it allocates nothing — symmetric with guest_dealloc's no-op.
     if size <= 0 {
         return std::ptr::NonNull::<u8>::dangling().as_ptr();
     }
@@ -55,64 +33,17 @@ pub extern "C" fn guest_dealloc(ptr: *mut u8, size: i32) {
     }
 }
 
-// ── Evaluate / drive ─────────────────────────────────────────────────────────────
-
+/// Run one assembled script to synchronous quiescence and return its output blob.
+/// The return value packs the blob location: `(ptr << 32) | len`. The host reads
+/// those `len` bytes of JSON, then frees them with `guest_dealloc(ptr, len)`. The
+/// blob is placed in a `guest_alloc` buffer so that free is symmetric.
 #[no_mangle]
-pub extern "C" fn eval_code(code: *const u8, code_len: i32) -> i32 {
-    engine::eval(unsafe { view(code, code_len) })
-}
-
-#[no_mangle]
-pub extern "C" fn run_microtasks() -> i32 {
-    engine::run_microtasks()
-}
-
-#[no_mangle]
-pub extern "C" fn resolve_handle(handle: i32, value: *const u8, value_len: i32, is_error: i32) {
-    let value = String::from_utf8_lossy(unsafe { view(value, value_len) }).into_owned();
-    engine::resolve(handle, &value, is_error != 0);
-}
-
-// ── Pending host calls ───────────────────────────────────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn get_pending_count() -> i32 {
-    engine::pending_count()
-}
-
-#[no_mangle]
-pub extern "C" fn get_pending_handles(out: *mut i32, capacity: i32) -> i32 {
-    if out.is_null() || capacity <= 0 {
-        return 0;
+pub extern "C" fn execute(script_ptr: *const u8, script_len: i32) -> u64 {
+    let out = engine::execute_script(unsafe { view(script_ptr, script_len) });
+    let n = out.len();
+    let buf = guest_alloc(n as i32);
+    if n > 0 {
+        unsafe { std::ptr::copy_nonoverlapping(out.as_ptr(), buf, n) };
     }
-    let slice = unsafe { std::slice::from_raw_parts_mut(out, capacity as usize) };
-    engine::fill_pending_handles(slice) as i32
-}
-
-// ── Result / error readback ──────────────────────────────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn get_result_ptr() -> *const u8 {
-    engine::result_ptr()
-}
-#[no_mangle]
-pub extern "C" fn get_result_len() -> i32 {
-    engine::result_len()
-}
-#[no_mangle]
-pub extern "C" fn get_result_is_error() -> i32 {
-    engine::result_is_error()
-}
-#[no_mangle]
-pub extern "C" fn get_error_ptr() -> *const u8 {
-    engine::error_ptr()
-}
-#[no_mangle]
-pub extern "C" fn get_error_len() -> i32 {
-    engine::error_len()
-}
-
-#[no_mangle]
-pub extern "C" fn cleanup() {
-    engine::cleanup()
+    ((buf as u64) << 32) | (n as u64)
 }
