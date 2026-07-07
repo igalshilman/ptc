@@ -258,7 +258,7 @@ func (e *Engine) Run(
 	}()
 
 	var journal []ToolResult
-	for round := 0; round < maxProgramRounds; round++ {
+	for range maxProgramRounds {
 		out, execErr := g.execute(ctx, []byte(assemble(journal)))
 		if execErr != nil {
 			return "", execErr
