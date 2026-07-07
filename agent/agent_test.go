@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -165,6 +166,45 @@ func TestGracefulShutdownWaitsForInflight(t *testing.T) {
 
 	if _, e := eng.Run(ctx, `return 1;`, res); !errors.Is(e, errEngineClosed) {
 		t.Fatalf("expected errEngineClosed after Close, got %v", e)
+	}
+}
+
+// TestConcurrentRunsAreIsolated: many concurrent Runs over ONE shared Engine (as
+// concurrent Agent/<session>/Ask invocations do) must not share QuickJS state.
+// Each goroutine runs a program that awaits a tool echoing its own unique value and
+// returns a value derived from it; if the pool ever handed one wasm instance to two
+// goroutines, or the guest state weren't per-instance, results would cross-
+// contaminate (or -race would fire on the shared Engine/pool). 128 goroutines >
+// poolMaxIdle (32), so instances churn through the pool under contention.
+func TestConcurrentRunsAreIsolated(t *testing.T) {
+	eng, ctx := newTestEngine(t) // shared across all goroutines
+	const n = 128
+	errs := make(chan error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(k int) {
+			defer wg.Done()
+			inv := &testInvoker{}
+			inv.add("echo", func(_ context.Context, _ json.RawMessage) (json.RawMessage, error) {
+				return json.RawMessage(fmt.Sprintf(`{"v":%d}`, k)), nil
+			})
+			// await forces a full host round-trip (pending → resolve → microtasks),
+			// exercising per-instance state concurrently.
+			out, err := NewSandbox(eng, inv).RunProgram(ctx, `const r = await echo({}); return r.v * 1000 + 7;`)
+			if err != nil {
+				errs <- fmt.Errorf("goroutine %d: %w", k, err)
+				return
+			}
+			if want := fmt.Sprintf("%d", k*1000+7); out != want {
+				errs <- fmt.Errorf("goroutine %d: got %q want %q (cross-instance state contamination)", k, out, want)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Error(e)
 	}
 }
 
