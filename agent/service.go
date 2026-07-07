@@ -29,9 +29,16 @@ type Service struct {
 	client        openai.Client
 	model         string
 	tools         []Tool
+	toolByName    map[string]Tool // for the AgentTools/Exec dispatch (seq tools)
 	maxRounds     int
 	programBudget time.Duration
 }
+
+// Names of the companion service that runs seq tools as their own sub-invocations.
+const (
+	agentToolsService = "AgentTools"
+	execMethod        = "Exec"
+)
 
 // NewService builds the QuickJS engine and assembles the agent from cfg.
 func NewService(ctx context.Context, cfg Config) (*Service, error) {
@@ -51,11 +58,16 @@ func NewService(ctx context.Context, cfg Config) (*Service, error) {
 	if budget == 0 {
 		budget = 60 * time.Second
 	}
+	byName := make(map[string]Tool, len(cfg.Tools))
+	for _, t := range cfg.Tools {
+		byName[t.Name] = t
+	}
 	return &Service{
 		engine:        eng,
 		client:        cfg.Client,
 		model:         model,
 		tools:         cfg.Tools,
+		toolByName:    byName,
 		maxRounds:     rounds,
 		programBudget: budget,
 	}, nil
@@ -64,13 +76,39 @@ func NewService(ctx context.Context, cfg Config) (*Service, error) {
 // Close releases the engine (call on shutdown).
 func (s *Service) Close(ctx context.Context) error { return s.engine.Close(ctx) }
 
-// Definition returns the Restate Virtual Object to bind: handlers
-// Ask (drive a turn), History (read transcript), Reset (clear).
-func (s *Service) Definition() restate.ServiceDefinition {
-	return restate.NewObject("Agent").
+// Definitions returns the Restate services to bind:
+//
+//   - "Agent" (Virtual Object): the session — Ask (drive a turn), History (read
+//     transcript), Reset (clear).
+//   - "AgentTools" (keyless service): a single Exec handler that runs a seq tool's
+//     multi-step body in its own sub-invocation, so seq tools may block/orchestrate
+//     freely and still parallelize with sibling tools in a Promise.all batch.
+func (s *Service) Definitions() []restate.ServiceDefinition {
+	agent := restate.NewObject("Agent").
 		Handler("Ask", restate.NewObjectHandler(s.Ask)).
 		Handler("History", restate.NewObjectSharedHandler(s.History)).
 		Handler("Reset", restate.NewObjectHandler(s.Reset))
+	tools := restate.NewService(agentToolsService).
+		Handler(execMethod, restate.NewServiceHandler(s.execTool))
+	return []restate.ServiceDefinition{agent, tools}
+}
+
+// execReq dispatches one seq-tool call to its registered body.
+type execReq struct {
+	Tool string          `json:"tool"`
+	Arg  json.RawMessage `json:"arg"`
+}
+
+// execTool is the AgentTools/Exec handler: it runs the named seq tool's blocking,
+// multi-step body with THIS invocation's own restate.Context. Reached via
+// RequestFuture from restateInvoker, so several seq tools run as independent,
+// concurrent invocations.
+func (s *Service) execTool(ctx restate.Context, req execReq) (json.RawMessage, error) {
+	t, ok := s.toolByName[req.Tool]
+	if !ok || t.seqHandler == nil {
+		return nil, restate.TerminalErrorf("unknown seq tool %q", req.Tool)
+	}
+	return t.seqHandler(ctx, req.Arg)
 }
 
 // AskInput is one message to a session (the object key is the session id).
@@ -167,38 +205,35 @@ func (r *restateInvoker) Tools() []ToolSpec {
 	specs := make([]ToolSpec, 0, len(r.order))
 	for _, name := range r.order {
 		t := r.tools[name]
-		specs = append(specs, ToolSpec{Name: t.Name, Description: t.Description, Params: t.Params})
+		specs = append(specs, ToolSpec{Name: t.Name, Description: t.Description, Params: t.Params, Result: t.Result})
 	}
 	return specs
 }
 
+// Invoke runs a single tool call. It just delegates to InvokeBatch (a batch of
+// one), so there is one code path. In practice the Sandbox always uses the
+// BatchInvoker path; this exists to satisfy the Invoker interface.
 func (r *restateInvoker) Invoke(_ context.Context, tool string, arg json.RawMessage) (json.RawMessage, error) {
-	t, ok := r.tools[tool]
-	if !ok {
-		return nil, restate.TerminalErrorf("unknown tool %q", tool)
-	}
-	if t.runHandler != nil {
-		// A single run-tool call: journal it as one durable step.
-		return restate.Run(r.rctx, func(rc restate.RunContext) (json.RawMessage, error) {
-			return t.runHandler(rc, arg)
-		}, restate.WithName(tool))
-	}
-	return t.contextHandler(r.rctx, arg)
+	res := r.InvokeBatch(nil, []ToolCall{{Tool: tool, Arg: arg}})
+	return res[0].Value, res[0].Err
 }
 
-// InvokeBatch resolves a batch of tool calls with durable PARALLELISM: every
-// run-tool is submitted via restate.RunAsync (so they execute concurrently), then
-// awaited; context tools run sequentially (they own the exclusive restate.Context
-// and may do nested ops). All calls, and their journaled results, stay in the
-// deterministic per-invocation order, so replay is stable.
+// InvokeBatch resolves a batch of tool calls with durable PARALLELISM through a
+// single, uniform driver: submit EVERY call as an in-flight Future (a leaf tool
+// submits in-process via Run/Call/Timer/…; a seq tool is dispatched to its own
+// AgentTools/Exec sub-invocation), then drive them all together with one
+// restate.Wait, then read each result BY INDEX. The driver never inspects the kind
+// of future — that is the whole point. Submissions happen in the deterministic
+// per-invocation order and results are read by index (not completion order), so
+// replay is stable regardless of which future settles first.
 func (r *restateInvoker) InvokeBatch(_ context.Context, calls []ToolCall) []ToolResult {
 	results := make([]ToolResult, len(calls))
 
 	type pending struct {
 		idx int
-		fut restate.RunAsyncFuture[json.RawMessage]
+		f   anyFuture
 	}
-	var async []pending
+	var pend []pending
 
 	for i, c := range calls {
 		t, ok := r.tools[c.Tool]
@@ -206,37 +241,68 @@ func (r *restateInvoker) InvokeBatch(_ context.Context, calls []ToolCall) []Tool
 			results[i] = ToolResult{Err: restate.TerminalErrorf("unknown tool %q", c.Tool)}
 			continue
 		}
-		if t.runHandler != nil {
-			arg, rh, name := c.Arg, t.runHandler, c.Tool // capture per iteration
-			fut := restate.RunAsync(r.rctx, func(rc restate.RunContext) (json.RawMessage, error) {
-				return rh(rc, arg)
-			}, restate.WithName(name))
-			async = append(async, pending{idx: i, fut: fut})
+		f, err := r.submit(t, c) // NON-blocking: reserves a journal slot, returns immediately
+		if err != nil {
+			results[i] = ToolResult{Err: err}
 			continue
 		}
-		// Context tool: runs now, sequentially (it owns its own restate.Run).
-		v, err := t.contextHandler(r.rctx, c.Arg)
-		results[i] = ToolResult{Value: v, Err: err}
+		pend = append(pend, pending{idx: i, f: f})
 	}
 
-	// All run-tools were submitted above and are in flight. restate.Wait drives
-	// the state machine, executing them CONCURRENTLY, and yields as each settles
-	// (matching the sanctioned fan-out/fan-in in examples/parallelizework). After
-	// the range every future is resolved, so we read each result by index.
-	if len(async) > 0 {
-		futs := make([]restate.Future, len(async))
-		for i, p := range async {
-			futs[i] = p.fut
+	// Every future above is in flight. restate.Wait drives the state machine,
+	// advancing them CONCURRENTLY and yielding as each settles; we discard the
+	// yield order and read each result by index (the identical discipline used for
+	// the sanctioned fan-out/fan-in in examples/parallelizework).
+	if len(pend) > 0 {
+		sels := make([]restate.Future, len(pend))
+		for j, p := range pend {
+			sels[j] = p.f.selectable()
 		}
-		for range restate.Wait(r.rctx, futs...) {
+		// restate.Wait yields each future as it settles; on a Restate CANCELLATION it
+		// yields a final (nil, TerminalError). That is invocation-fatal, NOT a
+		// per-tool failure: if we fell through and read the futures by index, each
+		// unfinished one would return a 409 and be demoted to a rejected JS promise
+		// that a defensive program could swallow (silently "succeeding" a cancelled
+		// turn). So capture it and abort the whole invocation instead.
+		var fatal restate.TerminalError
+		for _, werr := range restate.Wait(r.rctx, sels...) {
+			if werr != nil {
+				fatal = werr
+			}
 		}
-		for _, p := range async {
-			v, err := p.fut.Result()
+		if fatal != nil {
+			panic(fatalError{fatal})
+		}
+		for _, p := range pend {
+			v, err := p.f.resultJSON()
 			results[p.idx] = ToolResult{Value: v, Err: err}
 		}
 	}
 	return results
 }
+
+// submit turns one tool call into an in-flight durable Future WITHOUT blocking. A
+// leaf tool submits on the parent context (in-process, cheap). A seq tool is
+// dispatched to AgentTools/Exec, so its blocking multi-step body runs in its own
+// invocation and this call is just a ResponseFuture the batch driver awaits.
+func (r *restateInvoker) submit(t Tool, c ToolCall) (anyFuture, error) {
+	if t.submit != nil {
+		return t.submit(r.rctx, c.Arg)
+	}
+	f := restate.Service[json.RawMessage](r.rctx, agentToolsService, execMethod).
+		RequestFuture(execReq{Tool: c.Tool, Arg: c.Arg})
+	return rawFuture{sel: f, get: func() (json.RawMessage, error) { return f.Response() }}, nil
+}
+
+// rawFuture is an anyFuture whose payload is already JSON (a seq tool's
+// sub-invocation returns the tool's marshaled result), so no re-marshaling.
+type rawFuture struct {
+	sel restate.Future
+	get func() (json.RawMessage, error)
+}
+
+func (f rawFuture) selectable() restate.Future           { return f.sel }
+func (f rawFuture) resultJSON() (json.RawMessage, error) { return f.get() }
 
 // --- Model: the OpenAI-backed decision maker ---------------------------------
 

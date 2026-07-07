@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	restate "github.com/restatedev/sdk-go"
 )
 
 // resolverFunc adapts a func to the Resolver interface for engine-level tests.
@@ -72,12 +74,97 @@ func TestEnginePromiseAll(t *testing.T) {
 	}
 }
 
+// TestEngineManyPendingGrows: a Promise.all of 5000 concurrent host calls — well
+// past the old fixed MAX_PENDING (4096) — must all be tracked (the pending list
+// grows) and resolve, rather than the excess being rejected.
+func TestEngineManyPendingGrows(t *testing.T) {
+	eng, ctx := newTestEngine(t)
+	const n = 5000
+	res := resolverFunc(func(_ context.Context, calls []HostCall) []HostResult {
+		if len(calls) != n {
+			t.Fatalf("expected one batch of %d pending calls, got %d", n, len(calls))
+		}
+		out := make([]HostResult, len(calls))
+		for i, c := range calls {
+			out[i] = HostResult{Handle: c.Handle, Value: c.Arg} // echo the numeric arg
+		}
+		return out
+	})
+	code := fmt.Sprintf(`
+		const ps = [];
+		for (let i = 0; i < %d; i++) ps.push(__hostCall("echo", String(i)));
+		const r = await Promise.all(ps);
+		let sum = 0; for (const x of r) sum += Number(x);
+		return String(sum);`, n)
+	got, err := eng.Run(ctx, code, res)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if want := fmt.Sprintf("%d", n*(n-1)/2); got != want {
+		t.Fatalf("got %q, want %q (all %d calls must resolve, not just the first 4096)", got, want, n)
+	}
+}
+
 func TestEngineThrow(t *testing.T) {
 	eng, ctx := newTestEngine(t)
 	never := resolverFunc(func(_ context.Context, _ []HostCall) []HostResult { return nil })
 	_, err := eng.Run(ctx, `throw new Error("boom");`, never)
 	if err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("want error containing boom, got %v", err)
+	}
+}
+
+// TestGracefulShutdownWaitsForInflight: Close must wait for an in-flight Run to
+// finish (so runtime.Close can't close an instance under an active guest call), and
+// reject Runs started after Close begins.
+func TestGracefulShutdownWaitsForInflight(t *testing.T) {
+	ctx := context.Background()
+	eng, err := NewEngine(ctx, guestWasm)
+	if err != nil {
+		t.Fatalf("engine: %v", err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	res := resolverFunc(func(_ context.Context, calls []HostCall) []HostResult {
+		close(started) // signal we're mid-Run (tool invoked)
+		<-release      // block until the test lets go
+		out := make([]HostResult, len(calls))
+		for i, c := range calls {
+			out[i] = HostResult{Handle: c.Handle, Value: `{"v":1}`}
+		}
+		return out
+	})
+
+	runErr := make(chan error, 1)
+	go func() {
+		_, e := eng.Run(ctx, `const r = await __hostCall("t","x"); return JSON.stringify(r);`, res)
+		runErr <- e
+	}()
+	<-started // the Run is in-flight, blocked inside the tool
+
+	closeErr := make(chan error, 1)
+	go func() { closeErr <- eng.Close(context.Background()) }()
+	select {
+	case <-closeErr:
+		t.Fatal("Close returned before the in-flight Run finished")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(release) // let the Run finish
+	if e := <-runErr; e != nil {
+		t.Fatalf("in-flight Run failed (instance closed under it?): %v", e)
+	}
+	select {
+	case e := <-closeErr:
+		if e != nil {
+			t.Fatalf("Close: %v", e)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close did not return after the in-flight Run finished")
+	}
+
+	if _, e := eng.Run(ctx, `return 1;`, res); !errors.Is(e, errEngineClosed) {
+		t.Fatalf("expected errEngineClosed after Close, got %v", e)
 	}
 }
 
@@ -242,6 +329,28 @@ func TestDeterminism(t *testing.T) {
 	}
 }
 
+// TestDateFreezeNotEscapableViaConstructor: reaching Date through .constructor must
+// still yield the frozen `now`, not the pinned WASI clock, and `instanceof Date`
+// must still hold. nowMillis is deliberately != detFixedEpochSec*1000 so the two
+// are distinguishable.
+func TestDateFreezeNotEscapableViaConstructor(t *testing.T) {
+	eng, ctx := newTestEngine(t)
+	sb := NewSandbox(eng, &testInvoker{})
+	const now = 1800000000000 // 2027; differs from the pinned WASI constant (2023)
+	sb.SetDeterminism(1, now)
+	got, err := sb.RunProgram(ctx, `
+		const viaCtor = new (new Date().constructor)().getTime();
+		const direct = new Date().getTime();
+		const isInst = (new Date()) instanceof Date;
+		return {viaCtor, direct, isInst};`)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if got != `{"viaCtor":1800000000000,"direct":1800000000000,"isInst":true}` {
+		t.Fatalf("Date freeze escaped via .constructor, or instanceof broke: %s", got)
+	}
+}
+
 // TestToolSchemaSurfaced: a tool's JSON Schema and description appear in the
 // system prompt handed to the model.
 func TestToolSchemaSurfaced(t *testing.T) {
@@ -250,6 +359,66 @@ func TestToolSchemaSurfaced(t *testing.T) {
 		`{"type":"object","properties":{"expr":{"type":"string"}},"required":["expr"]}`, nil)
 	prompt := BuildSystemPrompt(inv.Tools())
 	for _, want := range []string{"calc", "evaluate math", `"expr"`, `"required":["expr"]`} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("system prompt missing %q; got:\n%s", want, prompt)
+		}
+	}
+}
+
+// TestToolShapeAndSchemas: NewTool is a leaf (submit set, seqHandler nil), NewSeqTool
+// is a sequence (seqHandler set, submit nil), and both reflect arg + result schemas
+// from their type params.
+func TestToolShapeAndSchemas(t *testing.T) {
+	type in struct {
+		X int `json:"x"`
+	}
+	type out struct {
+		Y string `json:"y"`
+	}
+	leaf := NewTool("leaf", "d", func(_ restate.Context, _ in) (Future[out], error) { return Future[out]{}, nil })
+	if leaf.submit == nil || leaf.seqHandler != nil {
+		t.Fatalf("NewTool must set submit (leaf), not seqHandler")
+	}
+	seq := NewSeqTool("seq", "d", func(_ restate.Context, _ in) (out, error) { return out{}, nil })
+	if seq.seqHandler == nil || seq.submit != nil {
+		t.Fatalf("NewSeqTool must set seqHandler (sequence), not submit")
+	}
+	for _, tl := range []Tool{leaf, seq} {
+		if !strings.Contains(string(tl.Params), `"x"`) {
+			t.Fatalf("%s: arg schema missing x: %s", tl.Name, tl.Params)
+		}
+		if !strings.Contains(string(tl.Result), `"y"`) {
+			t.Fatalf("%s: result schema missing y: %s", tl.Name, tl.Result)
+		}
+	}
+}
+
+// TestEmptyFutureRejected: a leaf tool that returns a zero-value Future (nil sel)
+// is rejected with a clear error by submit, instead of nil-panicking the batch
+// driver (which, being deterministic, would retry forever). The guard path never
+// touches the context, so a nil ctx is fine here.
+func TestEmptyFutureRejected(t *testing.T) {
+	type in struct{}
+	type out struct{}
+	tl := NewTool("empty", "d", func(_ restate.Context, _ in) (Future[out], error) {
+		return Future[out]{}, nil // author bug: not built via Run/Call/Timer/…
+	})
+	if _, err := tl.submit(nil, json.RawMessage(`{}`)); err == nil {
+		t.Fatal("expected submit to reject a zero-value Future, got nil error")
+	}
+}
+
+// TestResultSchemaSurfaced: a tool's RETURN schema (not just its args) reaches the
+// system prompt, so the model knows the shape a tool resolves to.
+func TestResultSchemaSurfaced(t *testing.T) {
+	specs := []ToolSpec{{
+		Name:        "weather",
+		Description: "get weather",
+		Params:      json.RawMessage(`{"type":"object","properties":{"city":{"type":"string"}}}`),
+		Result:      json.RawMessage(`{"type":"object","properties":{"tempC":{"type":"number"}}}`),
+	}}
+	prompt := BuildSystemPrompt(specs)
+	for _, want := range []string{"returns:", `"tempC"`, `"city"`} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("system prompt missing %q; got:\n%s", want, prompt)
 		}
@@ -464,6 +633,48 @@ func TestSession(t *testing.T) {
 	}
 	if users != 2 {
 		t.Fatalf("expected 2 user turns in session history, got %d", users)
+	}
+}
+
+// TestPoolReuseIsolation: when an instance is reused from the pool, one program's
+// global pollution must NOT be visible to the next (fresh JSContext per run). This
+// is the correctness/security property pooling depends on.
+func TestPoolReuseIsolation(t *testing.T) {
+	eng, ctx := newTestEngine(t)
+	sb := NewSandbox(eng, &testInvoker{})
+	// Program A pollutes the global object and a built-in prototype, then returns
+	// (so its instance is released back to the pool).
+	if _, err := sb.RunProgram(ctx, `globalThis.__leak = 123; Array.prototype.__pwn = 1; return {done:false};`); err != nil {
+		t.Fatalf("run A: %v", err)
+	}
+	// Program B reuses A's instance; it must see a pristine global.
+	got, err := sb.RunProgram(ctx, `return [typeof globalThis.__leak, typeof ([].__pwn)];`)
+	if err != nil {
+		t.Fatalf("run B: %v", err)
+	}
+	if got != `["undefined","undefined"]` {
+		t.Fatalf("state leaked across reused instance: %s", got)
+	}
+}
+
+// TestPoolReuseAfterThrowingMicrotask: a program that leaves a THROWING microtask
+// queued must not corrupt the next program on the reused instance. The microtask
+// queue lives on the shared Runtime; before drain_and_status was fixed to continue
+// past a throwing job, the leftover job ran against the next run's freed context
+// (use-after-free). Program B running cleanly on the reused instance guards it.
+func TestPoolReuseAfterThrowingMicrotask(t *testing.T) {
+	eng, ctx := newTestEngine(t)
+	sb := NewSandbox(eng, &testInvoker{})
+	if _, err := sb.RunProgram(ctx,
+		`try { queueMicrotask(function(){ throw new Error("boom"); }); } catch (e) {} return {done:true, answer:"a"};`); err != nil {
+		t.Fatalf("run A: %v", err)
+	}
+	got, err := sb.RunProgram(ctx, `return {done:true, answer: 6*7};`)
+	if err != nil {
+		t.Fatalf("run B (reused instance corrupted?): %v", err)
+	}
+	if got != `{"done":true,"answer":42}` {
+		t.Fatalf("run B got %q", got)
 	}
 }
 

@@ -31,8 +31,12 @@ func main() {
 
 	addr := envOr("AGENT_ADDR", ":9080")
 	log.Printf("durable CodeAct agent listening on %s", addr)
-	// The entry point binds the durable handler and serves it.
-	if err := server.NewRestate().Bind(svc.Definition()).Start(ctx, addr); err != nil {
+	// The entry point binds the durable services (Agent + AgentTools) and serves them.
+	srv := server.NewRestate()
+	for _, d := range svc.Definitions() {
+		srv = srv.Bind(d)
+	}
+	if err := srv.Start(ctx, addr); err != nil {
 		log.Fatalf("server: %v", err)
 	}
 }
@@ -59,6 +63,7 @@ func setup(ctx context.Context) (*agent.Service, error) {
 			computeTool(),
 			httpGetTool(),
 			waitTool(),
+			delayedFetchTool(),
 		},
 	})
 }

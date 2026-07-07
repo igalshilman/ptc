@@ -7,6 +7,11 @@
 # OS / editor cruft
 .DS_Store
 
+# Rust spike build artifacts (spike/*/) — source is committed, builds are not
+target/
+.cargo/
+Cargo.lock
+
 # NOTE: agent/quickjs_guest.wasm is intentionally COMMITTED — it's a prebuilt
 # artifact (see `make guest`) so `go build` works without the C/Docker toolchain.
 # Do NOT ignore it.

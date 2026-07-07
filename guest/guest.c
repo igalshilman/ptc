@@ -24,7 +24,11 @@ extern int32_t host_call(const char *name, int32_t name_len,
 
 /* ── Pending promise tracking ──────────────────────────────────── */
 
-#define MAX_PENDING 4096
+/* pending grows on demand (no fixed cap for legitimate fan-out). PENDING_MAX is a
+ * high safety ceiling — far above any real Promise.all — beyond which we reject
+ * cleanly, so a pathological program fails with a clear error instead of trapping
+ * on an allocation failure or exhausting the 256 MiB linear memory. */
+#define PENDING_MAX (1 << 20) /* 1,048,576 concurrent in-flight host calls */
 
 typedef struct {
     int32_t handle;
@@ -37,8 +41,9 @@ static JSContext *ctx;
 static JSValue main_promise = JS_UNINITIALIZED;
 static int main_settled = 0;
 
-static PendingOp pending[MAX_PENDING];
+static PendingOp *pending = NULL; /* growable; length pending_count, capacity pending_cap */
 static int pending_count = 0;
+static int pending_cap = 0;
 
 static char *result_buf;
 static int32_t result_len;
@@ -92,9 +97,29 @@ int32_t get_pending_handles(int32_t *out, int32_t capacity) {
 
 /* ── Internal helpers ──────────────────────────────────────────── */
 
-/* Returns 1 on success, 0 if the pending table is full. */
+/* Free every tracked promise capability and clear the list, keeping the backing
+ * array for reuse (cleanup() frees the array itself). Safe when pending_count==0,
+ * e.g. on a fresh instance before any context exists. */
+static void reset_pending(void) {
+    for (int i = 0; i < pending_count; i++) {
+        JS_FreeValue(ctx, pending[i].resolve);
+        JS_FreeValue(ctx, pending[i].reject);
+    }
+    pending_count = 0;
+}
+
+/* Returns 1 on success, 0 if the ceiling is hit or growth failed (the caller then
+ * rejects the promise). Grows the array geometrically on demand. */
 static int add_pending(int32_t handle, JSValue resolve, JSValue reject) {
-    if (pending_count >= MAX_PENDING) return 0;
+    if (pending_count >= PENDING_MAX) return 0;
+    if (pending_count == pending_cap) {
+        int new_cap = pending_cap ? pending_cap * 2 : 64;
+        if (new_cap > PENDING_MAX) new_cap = PENDING_MAX;
+        PendingOp *grown = realloc(pending, (size_t)new_cap * sizeof(PendingOp));
+        if (!grown) return 0;
+        pending = grown;
+        pending_cap = new_cap;
+    }
     pending[pending_count].handle = handle;
     pending[pending_count].resolve = JS_DupValue(ctx, resolve);
     pending[pending_count].reject = JS_DupValue(ctx, reject);
@@ -127,8 +152,9 @@ static void reject_with(JSValue reject, const char *message) {
 }
 
 /* Create a Promise for a host handle. A negative handle means the host refused
- * the call; a full pending table means too many concurrent calls — both reject
- * the promise immediately (with a clear message) instead of stranding it. */
+ * the call; hitting the PENDING_MAX ceiling (or an allocation failure while
+ * growing) means too many concurrent calls — both reject the promise immediately
+ * (with a clear message) instead of stranding it. */
 static JSValue make_promise_for_handle(int32_t handle) {
     JSValue funcs[2];
     JSValue promise = JS_NewPromiseCapability(ctx, funcs);
@@ -136,7 +162,7 @@ static JSValue make_promise_for_handle(int32_t handle) {
     if (handle < 0) {
         reject_with(funcs[1], "host refused the call");
     } else if (!add_pending(handle, funcs[0], funcs[1])) {
-        reject_with(funcs[1], "too many concurrent host calls (MAX_PENDING)");
+        reject_with(funcs[1], "too many concurrent host calls in flight");
     }
     JS_FreeValue(ctx, funcs[0]);
     JS_FreeValue(ctx, funcs[1]);
@@ -196,8 +222,11 @@ static JSValue on_main_rejected(JSContext *c, JSValueConst this_val,
 
 __attribute__((export_name("eval_code")))
 int32_t eval_code(const char *code, int32_t code_len) {
-    /* Reset state */
-    pending_count = 0;
+    /* Reset state, freeing anything left from a prior program on this instance
+     * (harmless on a fresh instance — the current one-instance-per-Run model — but
+     * makes the guest reuse-safe if instances are ever pooled). */
+    reset_pending();
+    if (rt) { JS_FreeValue(ctx, main_promise); main_promise = JS_UNINITIALIZED; }
     main_settled = 0;
     result_is_error = 0;
     free(result_buf); result_buf = NULL; result_len = 0;
@@ -303,11 +332,8 @@ int32_t run_microtasks(void) {
 
 __attribute__((export_name("cleanup")))
 void cleanup(void) {
-    for (int i = 0; i < pending_count; i++) {
-        JS_FreeValue(ctx, pending[i].resolve);
-        JS_FreeValue(ctx, pending[i].reject);
-    }
-    pending_count = 0;
+    reset_pending();
+    free(pending); pending = NULL; pending_cap = 0;
     if (!JS_IsUndefined(main_promise)) JS_FreeValue(ctx, main_promise);
     main_promise = JS_UNINITIALIZED;
     if (ctx) { JS_FreeContext(ctx); ctx = NULL; }

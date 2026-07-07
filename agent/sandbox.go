@@ -8,12 +8,14 @@ import (
 	"time"
 )
 
-// ToolSpec describes a tool to the model: its name, a human description, and a
-// JSON Schema for its single argument object (Params may be nil for no args).
+// ToolSpec describes a tool to the model: its name, a human description, and the
+// JSON Schemas for its single argument object (Params) and its return value
+// (Result). Either schema may be nil.
 type ToolSpec struct {
 	Name        string
 	Description string
 	Params      json.RawMessage
+	Result      json.RawMessage
 }
 
 // Invoker is the durable backend behind the JS tools. When a program running in
@@ -21,11 +23,11 @@ type ToolSpec struct {
 // (tool, arg) and the returned JSON becomes the JS promise's resolved value; a
 // non-nil error becomes a rejected promise. Implementations:
 //
-//   - mockInvoker (main.go): in-memory Go funcs, for the offline demo/tests.
-//   - restateInvoker (restate_bind.go, build tag `restate`): dispatches to
-//     developer tools holding a live restate.Context, so a tool can restate.Run
-//     a side effect, set a durable timer, call another service, etc. — journaled
-//     and replay-safe. None of that is visible to the JS program.
+//   - test doubles (agent_test.go): in-memory Go funcs, for the offline tests.
+//   - restateInvoker (service.go): submits each call as a durable Future — leaf
+//     tools in-process, seq tools as their own sub-invocation — and drives the
+//     whole batch with one restate.Wait. Journaled and replay-safe; none of that
+//     is visible to the JS program.
 type Invoker interface {
 	// Tools returns the registered tool specs, in a stable order. Names drive the
 	// JS prelude; the full specs (incl. JSON Schema) are surfaced to the model.
@@ -94,25 +96,51 @@ func (s *Sandbox) RunProgram(ctx context.Context, program string) (string, error
 	s.callSeq++
 	progSeed := int64(uint64(s.seed) ^ (uint64(seq)+1)*0x9e3779b97f4a7c15)
 
-	// Freeze the WASI clock/rand at the engine level (covers `new Date()`).
-	ctx = context.WithValue(ctx, ctxDetKey{}, determinism{nowMillis: s.nowMillis, randSeed: progSeed})
-
+	// Determinism is entirely JS-level now (determinismPrelude, below), carrying
+	// this run's progSeed/now — so it works even when the engine reuses a pooled
+	// instance whose WASI clock/rand were fixed at instantiation.
 	wrapped := "const __ret = await (async function () {\n" + program +
 		"\n})();\nreturn JSON.stringify(__ret === undefined ? null : __ret);"
 	src := s.determinismPrelude(progSeed) + s.prelude() + "\n" + wrapped
 	return s.engine.Run(ctx, src, s)
 }
 
-// determinismPrelude overrides the JS Math.random (seeded LCG) and Date.now
-// (frozen) so a replayed program reproduces identical values. QuickJS seeds its
-// own Math.random from the OS at context creation, so overriding it in JS is the
-// reliable fix; the frozen clock is also enforced at the WASI level (Engine.Run).
+// determinismPrelude makes a program's clock and randomness replay-stable, entirely
+// at the JS level so it survives instance REUSE (a pooled instance's WASI clock/rand
+// are bound at instantiation and cannot be re-seeded per run — see Engine.Run). It
+// overrides, per program, using this run's seed and frozen now:
+//   - Math.random (a seeded LCG),
+//   - the Date CONSTRUCTOR (not just Date.now — `new Date()` otherwise reads the
+//     host clock, not Date.now) so no-arg construction and Date() return the frozen
+//     now, while explicit-arg construction/parsing delegate to the real Date,
+//   - crypto.getRandomValues and performance.now if present.
 func (s *Sandbox) determinismPrelude(seed int64) string {
 	return fmt.Sprintf(";(function(){\n"+
 		"  var __s = %d >>> 0;\n"+
 		"  Math.random = function(){ __s = (Math.imul(__s, 1664525) + 1013904223) >>> 0; return __s / 4294967296; };\n"+
 		"  var __now = %d;\n"+
-		"  Date.now = function(){ return __now; };\n"+
+		"  var RealDate = Date;\n"+
+		"  function FakeDate() {\n"+
+		"    if (!(this instanceof FakeDate)) return new RealDate(__now).toString();\n"+
+		"    return arguments.length ? new RealDate(...arguments) : new RealDate(__now);\n"+
+		"  }\n"+
+		"  FakeDate.prototype = RealDate.prototype;\n"+
+		// Redirect .constructor to FakeDate too, else `new (new Date()).constructor()`
+		// reaches the native Date and reads the (fixed constant) host clock instead of
+		// __now. Scoped to this run's fresh context, so no cross-run mutation leaks.
+		"  try { RealDate.prototype.constructor = FakeDate; } catch (e) {}\n"+
+		"  FakeDate.now = function(){ return __now; };\n"+
+		"  FakeDate.parse = RealDate.parse;\n"+
+		"  FakeDate.UTC = RealDate.UTC;\n"+
+		"  globalThis.Date = FakeDate;\n"+
+		// Best-effort: some builds mark these read-only/non-configurable, so guard
+		// against a throw (Math.random + Date above are the load-bearing overrides).
+		"  try { if (globalThis.crypto && globalThis.crypto.getRandomValues) {\n"+
+		"    globalThis.crypto.getRandomValues = function(a){ for (var i = 0; i < a.length; i++) a[i] = (Math.random() * 256) | 0; return a; };\n"+
+		"  } } catch (e) {}\n"+
+		"  try { if (globalThis.performance && globalThis.performance.now) {\n"+
+		"    globalThis.performance.now = function(){ return 0; };\n"+
+		"  } } catch (e) {}\n"+
 		"})();\n", uint32(seed), s.nowMillis)
 }
 

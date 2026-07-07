@@ -14,6 +14,7 @@ type guest struct {
 	mem api.Memory
 
 	fnAlloc          api.Function
+	fnDealloc        api.Function
 	fnEval           api.Function
 	fnMicrotasks     api.Function
 	fnPendingCount   api.Function
@@ -24,6 +25,8 @@ type guest struct {
 	fnResultIsError  api.Function
 	fnErrorPtr       api.Function
 	fnErrorLen       api.Function
+
+	runs int // how many programs this (pooled) instance has run; drives recycling
 }
 
 func newGuest(mod api.Module) *guest {
@@ -31,6 +34,7 @@ func newGuest(mod api.Module) *guest {
 		mod:              mod,
 		mem:              mod.Memory(),
 		fnAlloc:          mod.ExportedFunction("guest_alloc"),
+		fnDealloc:        mod.ExportedFunction("guest_dealloc"),
 		fnEval:           mod.ExportedFunction("eval_code"),
 		fnMicrotasks:     mod.ExportedFunction("run_microtasks"),
 		fnPendingCount:   mod.ExportedFunction("get_pending_count"),
@@ -62,6 +66,16 @@ func (g *guest) alloc(ctx context.Context, size uint32) uint32 {
 	return uint32(call1(ctx, g.fnAlloc, uint64(size)))
 }
 
+// dealloc frees a buffer obtained from alloc. It matters for REUSED (pooled)
+// instances: without it, per-run host buffers (code/values/pending handles) would
+// accumulate in the instance's linear memory across runs. size must match alloc.
+func (g *guest) dealloc(ctx context.Context, ptr, size uint32) {
+	if g.fnDealloc == nil || ptr == 0 || size == 0 {
+		return
+	}
+	_, _ = g.fnDealloc.Call(ctx, uint64(ptr), uint64(size))
+}
+
 func (g *guest) evalCode(ctx context.Context, ptr, ln uint32) int32 {
 	return int32(uint32(call1(ctx, g.fnEval, uint64(ptr), uint64(ln))))
 }
@@ -91,6 +105,7 @@ func (g *guest) pendingHandles(ctx context.Context) []uint32 {
 		}
 		handles = append(handles, h)
 	}
+	g.dealloc(ctx, out, count*4) // handles copied out; free the guest buffer
 	return handles
 }
 

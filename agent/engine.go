@@ -16,8 +16,10 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"sync"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -25,26 +27,30 @@ import (
 	"github.com/tetratelabs/wazero/sys"
 )
 
-// determinism, when present on the call context, freezes the guest's WASI clock
-// and randomness so a program re-run on replay produces identical results (e.g.
-// `new Date()` and any WASI getrandom). The Math.random/Date.now JS builtins are
-// additionally overridden in the sandbox prelude. Sandbox.RunProgram sets this;
-// direct engine callers (tests) omit it and get the real clock/rand.
-type determinism struct {
-	nowMillis int64
-	randSeed  int64
-}
+// The WASI clock/rand are pinned to these FIXED constants on every instance (see
+// Engine.Run). They must never vary — a value that changed per run could not be
+// applied to a REUSED (pooled) instance, whose WASI config is bound at
+// instantiation. The per-invocation seed/clock a program actually observes is
+// injected in JS by Sandbox.determinismPrelude, which is re-run every program; this
+// pin is only defense-in-depth against a nondeterminism source the prelude missed.
+const (
+	detFixedEpochSec int64  = 1_700_000_000 // arbitrary fixed wall-clock second
+	detFixedSeed     uint64 = 0x9e3779b97f4a7c15
+)
 
-type ctxDetKey struct{}
-
-// lcgReader is a deterministic byte source seeded from a replay-stable seed, used
-// as the guest's WASI random source under determinism.
+// lcgReader is a deterministic byte source (fixed seed) used as the guest's WASI
+// random source, so any WASI getrandom the engine seeds from is replay-stable.
 type lcgReader struct{ state uint64 }
 
 func (r *lcgReader) Read(p []byte) (int, error) {
+	// Non-mutating: derive bytes into a local so r.state never changes. That keeps
+	// the WASI rand replay- AND reuse-stable (a pooled instance never diverges from
+	// a fresh one) with no shared-state race. It's only a defense-in-depth backstop —
+	// JS Math.random/crypto are overridden per run in the prelude.
+	s := r.state
 	for i := range p {
-		r.state = r.state*6364136223846793005 + 1442695040888963407
-		p[i] = byte(r.state >> 56)
+		s = s*6364136223846793005 + 1442695040888963407
+		p[i] = byte(s >> 56)
 	}
 	return len(p), nil
 }
@@ -80,6 +86,15 @@ type Resolver interface {
 	Resolve(ctx context.Context, calls []HostCall) []HostResult
 }
 
+// fatalError signals that program execution must ABORT with this error rather than
+// be fed back to the model as a recoverable observation. A Resolver panics with it
+// for invocation-fatal conditions (e.g. a Restate cancellation reported by the
+// batch driver); Engine.Run's recover surfaces err verbatim so its terminal-ness
+// is preserved all the way up to the Ask handler (which then does not persist
+// state). It unwinds only pure Go stack — the wasm call has already returned before
+// Resolve runs — so it is safe.
+type fatalError struct{ err error }
+
 // runState is per-invocation state carried through the wazero call context, so
 // the shared `env` host functions can record calls against the active run.
 type runState struct {
@@ -102,18 +117,52 @@ func stateFrom(ctx context.Context) *runState {
 }
 
 // Engine holds the one-time wazero setup: a runtime with WASI + the `env` host
-// module registered, and the guest compiled once. Instantiate a fresh instance
-// per Run for isolation.
+// module registered, and the guest compiled once. Guest instances are POOLED and
+// reused across Runs (see acquire/release): an instance is checked out EXCLUSIVELY
+// per Run and reset by the next eval_code (fresh JSContext + cleared pending/result
+// in the Rust guest), which avoids the ~10 MB/Run re-instantiation churn while
+// keeping per-run isolation. Exclusive checkout is what makes reuse safe for the
+// single-threaded guest — never hand one instance to two goroutines at once.
 type Engine struct {
-	runtime  wazero.Runtime
-	compiled wazero.CompiledModule
+	runtime       wazero.Runtime
+	compiled      wazero.CompiledModule
+	hasInitialize bool        // guest is a WASI reactor (C guest) vs a plain cdylib (Rust guest)
+	free          chan *guest // idle, reset-ready instances available for reuse
+
+	mu       sync.Mutex     // guards closing; serializes it against inflight.Add
+	closing  bool           // set by Close; rejects new Runs
+	inflight sync.WaitGroup // in-flight Runs, so Close can drain before closing the runtime
+}
+
+// errEngineClosed is returned by Run once Close has begun.
+var errEngineClosed = errors.New("engine is closing")
+
+// enter registers an in-flight Run, or reports that the engine is closing. The
+// mutex serializes the closing check + Add against Close setting closing, so no
+// Add can race with (or follow) inflight.Wait.
+func (e *Engine) enter() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closing {
+		return false
+	}
+	e.inflight.Add(1)
+	return true
 }
 
 // maxMemoryPages caps each guest instance's linear memory (pages × 64 KiB), a
 // host-side backstop against a runaway program allocating until OOM. 4096 pages
-// = 256 MiB. (The guest's own QuickJS heap is uncapped — JS_SetMemoryLimit would
-// need a guest.c rebuild — so this wazero limit is the enforced ceiling.)
+// = 256 MiB.
 const maxMemoryPages = 4096
+
+// Pool bounds: how many idle instances to keep, and when to retire a reused one so
+// a long-lived JSRuntime's interned atoms / grown linear memory can't accumulate
+// forever.
+const (
+	poolMaxIdle          = 32       // idle instances kept for reuse (excess are closed)
+	maxRunsPerInstance   = 256      // recycle an instance after this many programs
+	instanceMemHighWater = 64 << 20 // recycle an instance whose linear memory grew past this
+)
 
 // NewEngine builds the runtime, registers WASI preview1 and the `env` host
 // module, and compiles the guest. The runtime is configured so a per-program
@@ -143,11 +192,96 @@ func NewEngine(ctx context.Context, wasm []byte) (*Engine, error) {
 		_ = r.Close(ctx)
 		return nil, fmt.Errorf("compile guest: %w", err)
 	}
-	return &Engine{runtime: r, compiled: compiled}, nil
+	// The C guest is a WASI reactor (exports `_initialize`, which must run before
+	// other exports); the Rust cdylib guest has none (Rust inits statics lazily).
+	_, hasInit := compiled.ExportedFunctions()["_initialize"]
+	return &Engine{
+		runtime:       r,
+		compiled:      compiled,
+		hasInitialize: hasInit,
+		free:          make(chan *guest, poolMaxIdle),
+	}, nil
 }
 
-// Close releases the runtime.
-func (e *Engine) Close(ctx context.Context) error { return e.runtime.Close(ctx) }
+// Close stops accepting new Runs, waits (bounded by ctx) for in-flight Runs to
+// finish so runtime.Close can't pull an instance out from under an active guest
+// call, then drains and closes any pooled instances and releases the runtime. If
+// ctx fires first, it closes anyway (any still-running Run then traps, recovered
+// into an error) — best-effort graceful shutdown.
+func (e *Engine) Close(ctx context.Context) error {
+	e.mu.Lock()
+	e.closing = true
+	e.mu.Unlock()
+
+	drained := make(chan struct{})
+	go func() { e.inflight.Wait(); close(drained) }()
+	select {
+	case <-drained:
+	case <-ctx.Done():
+	}
+
+	for {
+		select {
+		case g := <-e.free:
+			_ = g.mod.Close(ctx)
+		default:
+			return e.runtime.Close(ctx)
+		}
+	}
+}
+
+// newModuleConfig builds a guest instance's config. It is FIXED (no per-run values)
+// so a pooled instance never needs re-configuration: the WASI clock/rand are pinned
+// to constants (per-run determinism lives in the JS prelude), stdio goes to the
+// host, and the start function depends on the guest kind. A fresh lcgReader per
+// instance keeps the rand source unshared (no cross-instance data race).
+func (e *Engine) newModuleConfig() wazero.ModuleConfig {
+	cfg := wazero.NewModuleConfig().
+		WithName(""). // anonymous: allow many concurrent instances
+		WithStdout(os.Stdout).WithStderr(os.Stderr).
+		WithWalltime(func() (int64, int32) { return detFixedEpochSec, 0 }, sys.ClockResolution(1_000_000)).
+		WithNanotime(func() int64 { return 0 }, sys.ClockResolution(1_000_000)).
+		WithRandSource(&lcgReader{state: detFixedSeed})
+	if e.hasInitialize {
+		return cfg.WithStartFunctions("_initialize") // reactor init — NOT the default _start
+	}
+	return cfg.WithStartFunctions() // cdylib (Rust): no start function
+}
+
+// acquire checks out an idle instance from the pool, or instantiates a fresh one.
+// New instances are created with a background context so their lifetime is NOT tied
+// to any Run's (possibly-cancelled/timed-out) context — only the guest CALLS carry
+// the per-Run context (for the timeout + runState).
+func (e *Engine) acquire() (*guest, error) {
+	select {
+	case g := <-e.free:
+		return g, nil
+	default:
+		mod, err := e.runtime.InstantiateModule(context.Background(), e.compiled, e.newModuleConfig())
+		if err != nil {
+			return nil, fmt.Errorf("instantiate guest: %w", err)
+		}
+		return newGuest(mod), nil
+	}
+}
+
+// release returns a healthy instance to the pool for reuse, or closes it. An
+// instance is retired (not reused) if the Run failed/timed out (it may be a
+// wazero-closed or inconsistent instance), if it has served enough runs, or if its
+// linear memory grew past the high-water mark (it never shrinks).
+func (e *Engine) release(ctx context.Context, g *guest, healthy bool) {
+	if !healthy ||
+		g.runs >= maxRunsPerInstance ||
+		(g.mem != nil && uint64(g.mem.Size()) > instanceMemHighWater) {
+		_ = g.mod.Close(ctx)
+		return
+	}
+	select {
+	case e.free <- g:
+	default:
+		_ = g.mod.Close(ctx) // pool full
+	}
+}
 
 // hostCall implements env.host_call(name_ptr, name_len, arg_ptr, arg_len) -> handle.
 // It reads the tool name and argument from guest memory, records the pending call,
@@ -169,51 +303,53 @@ func hostCall(ctx context.Context, m api.Module, namePtr, nameLen, argPtr, argLe
 // time budget) or the memory limit was hit, that surfaces here as a normal error
 // the caller can feed back to the model — not a crashed goroutine.
 func (e *Engine) Run(ctx context.Context, code string, resolver Resolver) (result string, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			result = ""
-			if ce := ctx.Err(); ce != nil {
-				err = fmt.Errorf("program exceeded its time limit: %w", ce)
-			} else {
-				err = fmt.Errorf("guest execution failed: %v", r)
-			}
-		}
-	}()
+	if !e.enter() {
+		return "", errEngineClosed
+	}
+	defer e.inflight.Done() // registered first ⇒ runs LAST, after release below
 
 	st := &runState{pending: map[uint32]*HostCall{}}
 	ctx = context.WithValue(ctx, ctxStateKey{}, st)
 
-	cfg := wazero.NewModuleConfig().
-		WithName(""). // anonymous: allow many concurrent instances
-		WithStdout(os.Stdout).WithStderr(os.Stderr).
-		WithStartFunctions("_initialize") // reactor init — NOT the default _start
-
-	// Under determinism, freeze the WASI wall/monotonic clock and randomness so a
-	// replayed program reproduces identical results (covers `new Date()` and any
-	// WASI getrandom the engine seeds from).
-	if det, ok := ctx.Value(ctxDetKey{}).(determinism); ok {
-		sec, nsec := det.nowMillis/1000, int32((det.nowMillis%1000)*1_000_000)
-		cfg = cfg.
-			WithWalltime(func() (int64, int32) { return sec, nsec }, sys.ClockResolution(1_000_000)).
-			WithNanotime(func() int64 { return det.nowMillis * 1_000_000 }, sys.ClockResolution(1_000_000)).
-			WithRandSource(&lcgReader{state: uint64(det.randSeed) + 0x9e3779b97f4a7c15})
-	}
-
-	mod, err := e.runtime.InstantiateModule(ctx, e.compiled, cfg)
+	g, err := e.acquire() // reused from the pool, or freshly instantiated
 	if err != nil {
-		return "", fmt.Errorf("instantiate guest: %w", err)
+		return "", err
 	}
-	defer mod.Close(ctx)
-
-	g := newGuest(mod)
+	g.runs++
+	healthy := false
+	defer func() {
+		if r := recover(); r != nil {
+			result = ""
+			switch v := r.(type) {
+			case fatalError:
+				// Invocation-fatal (e.g. a Restate cancellation): keep err verbatim so
+				// its terminal-ness reaches RunAgent/Ask instead of being swallowed.
+				err = v.err
+			default:
+				if ce := ctx.Err(); ce != nil {
+					err = fmt.Errorf("program exceeded its time limit: %w", ce)
+				} else {
+					err = fmt.Errorf("guest execution failed: %v", r)
+				}
+			}
+		}
+		// Reuse the instance only if the program reached a clean guest status and the
+		// context didn't fire; a trap/timeout (recovered above, so healthy is still
+		// false) may have left it wazero-closed, so it is retired instead. A mere
+		// program error (js error / rejection) keeps healthy=true — the next
+		// eval_code resets it with a fresh context, so it is safe to reuse.
+		e.release(ctx, g, healthy && ctx.Err() == nil)
+	}()
 
 	codePtr := g.alloc(ctx, uint32(len(code)))
 	g.write(codePtr, []byte(code))
 	status := g.evalCode(ctx, codePtr, uint32(len(code)))
+	g.dealloc(ctx, codePtr, uint32(len(code))) // the guest copied the code
 
 	for {
 		switch status {
 		case statusDone:
+			healthy = true // program-level result or rejection; instance is reusable
 			return g.result(ctx)
 
 		case statusError:
@@ -221,6 +357,7 @@ func (e *Engine) Run(ctx context.Context, code string, resolver Resolver) (resul
 			if msg == "" {
 				msg = "no pending ops and promise not settled (deadlock)"
 			}
+			healthy = true // a program error, not a trap; a reset makes it reusable
 			return "", fmt.Errorf("js error: %s", msg)
 
 		case statusHasPending:
@@ -242,6 +379,7 @@ func (e *Engine) Run(ctx context.Context, code string, resolver Resolver) (resul
 					isErr = 1
 				}
 				g.resolveHandle(ctx, res.Handle, valPtr, uint32(len(res.Value)), isErr)
+				g.dealloc(ctx, valPtr, uint32(len(res.Value))) // the guest copied the value
 				delete(st.pending, res.Handle)
 			}
 			status = g.runMicrotasks(ctx)

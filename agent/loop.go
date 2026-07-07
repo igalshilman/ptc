@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	restate "github.com/restatedev/sdk-go"
 )
 
 // ErrMaxRounds is returned when the agent exhausts its round budget. This is a
@@ -76,13 +78,16 @@ func BuildSystemPrompt(specs []ToolSpec) string {
 		b.WriteString("No tools are available.")
 		return b.String()
 	}
-	b.WriteString("Tools (async JS functions; each takes ONE argument matching its JSON Schema):\n")
+	b.WriteString("Tools (async JS functions; each takes ONE argument matching its JSON Schema and resolves to a value matching its return schema):\n")
 	for _, s := range specs {
 		fmt.Fprintf(&b, "  • %s — %s\n", s.Name, s.Description)
 		if len(s.Params) > 0 {
 			fmt.Fprintf(&b, "      args schema: %s\n", compactJSON(s.Params))
 		} else {
 			b.WriteString("      args: none\n")
+		}
+		if len(s.Result) > 0 {
+			fmt.Fprintf(&b, "      returns: %s\n", compactJSON(s.Result))
 		}
 	}
 	b.WriteString("Only these tools exist; there is no other global, network, or filesystem access.")
@@ -188,7 +193,14 @@ func RunAgent(ctx context.Context, sb *Sandbox, model Model, convo *Conversation
 		convo.Turns = append(convo.Turns, Turn{Role: RoleAssistant, Content: dec.Code})
 
 		if runErr != nil {
-			// Not fatal: report the failure so the model can fix its program.
+			// A terminal error is invocation-fatal (e.g. a Restate cancellation the
+			// batch driver surfaced) — abort the turn so it isn't persisted, rather
+			// than feeding it back. (Tool-level failures arrive as rejected JS
+			// promises, i.e. a non-terminal program error, and ARE fed back.)
+			if restate.IsTerminalError(runErr) {
+				return "", runErr
+			}
+			// Recoverable: report the failure so the model can fix its program.
 			feedback(round, runErr.Error())
 			continue
 		}

@@ -21,27 +21,35 @@ paths, no `replace`. `go build ./...` works from anywhere.
 ```
 quickjs-worker-go/          project root — run all `go` commands here
 ├── cmd/agent/              package main — THE entry point (USER code)
-│   ├── main.go             setup() wires client+tools+loop; main() binds handler & serves
-│   └── tools.go            the developer's durable tools (compute / http_get / wait)
+│   ├── main.go             setup() wires client+tools+loop; main() binds services & serves
+│   └── tools.go            the developer's durable tools (compute / http_get / wait / delayed_fetch)
 ├── agent/                  package agent — reusable durable-CodeAct engine (INFRA)
 │   ├── engine.go           wazero driver; registers the single `env.host_call` import; determinism
 │   ├── guest.go            cached guest export handles + linear-memory helpers
 │   ├── wasm.go             //go:embed quickjs_guest.wasm
 │   ├── sandbox.go          runs one JS program; tool prelude over __hostCall; Invoker/BatchInvoker
 │   ├── loop.go             RunAgent (the Go loop) + Model/Decision/Conversation/Turn + BuildSystemPrompt
-│   ├── tool.go             Tool, NewTool, NewRunTool (typed handlers → reflected JSON Schema)
-│   ├── service.go          Config, Service, NewService, Definition; Ask/History/Reset; restateInvoker; openAIModel
+│   ├── tool.go             Tool, NewTool (leaf→Future) / NewSeqTool (sequence); Future[R] + Run/Call/CallObject/Timer/Awakeable helpers; reflected arg+result schemas
+│   ├── service.go          Config, Service, NewService, Definitions; Ask/History/Reset; execTool (AgentTools/Exec); restateInvoker (unified Wait driver); openAIModel
 │   ├── quickjs_guest.wasm  the embedded guest (~1 MB, built from guest/)
-│   └── agent_test.go       in-package tests + test doubles (~18 tests)
-└── guest/                  guest.c + Dockerfile.build (C source; NOT a Go package)
+│   ├── agent_test.go       in-package tests + test doubles (~20 tests)
+│   └── bench_test.go       instantiate/round/parallel benchmarks (the pool-decision evidence)
+├── guest-rs/               ACTIVE guest: Rust/rquickjs → wasm32-wasip1 (`make guest-rs`)
+├── guest/                  legacy C guest + Dockerfile.build (superseded by guest-rs)
+└── spike/rquickjs-guest/   the original feasibility spike (kept for its README notes)
 ```
 
 - **Entry command:** `go run ./cmd/agent` (the module root is NOT runnable — no `main` there).
 - **Public API** that `cmd/agent` uses from the `agent` package: `Config`,
-  `NewService`, `Service.Definition()`, `Service.Close()`, `Tool`, `NewTool`,
-  `NewRunTool`. Everything else in `agent` is internal machinery.
+  `NewService`, `Service.Definitions()`, `Service.Close()`, `Tool`, `NewTool`,
+  `NewSeqTool`, `Future[R]`, and the future helpers `Run`/`Call`/`CallObject`/
+  `Timer`/`Awakeable`. Everything else in `agent` is internal machinery.
 - **To add a capability:** write a tool in `cmd/agent/tools.go` and register it in
   `setup()` in `cmd/agent/main.go`. Nothing in `agent/` needs to change.
+  - A **leaf tool** (`NewTool`) is one durable op: its body returns a `Future[R]`
+    from exactly one non-blocking `agent.Run`/`Call`/`Timer`/`Awakeable`.
+  - A **seq tool** (`NewSeqTool`) is a blocking multi-step handler (full
+    `restate.Context`); it runs in its own `AgentTools/Exec` sub-invocation.
 
 ---
 
@@ -99,8 +107,10 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
   each round:
     ├─ model.Decide ── restate.Run ─▶ OpenAI ─▶ Decision{ code }        (durable step)
     └─ Sandbox.RunProgram(code) ─▶ QuickJS (wazero) runs the program
-            │  await someTool(args)                    ← plain async JS
-            └─ traps to Go (env.host_call) ─▶ tool ── restate.Run/RunAsync ─▶ side effect   (durable step)
+            │  await Promise.all([toolA(x), toolB(y)])  ← plain async JS; one batch
+            └─ traps to Go (env.host_call) ─▶ InvokeBatch: submit each as a durable
+                 Future (leaf = in-process Run/Call/Timer │ seq = RequestFuture to
+                 AgentTools/Exec) ─▶ one restate.Wait drives them in PARALLEL   (durable steps)
        program returns {done:true, answer}  → loop ends
        program returns anything else        → observation → next round
 ```
@@ -118,15 +128,27 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
   sandbox prelude defines each registered tool as a JS function over `__hostCall`.
   (Earlier versions hijacked a fixed `webSearch` import as a transport — that hack
   is gone.)
-- **Two tool styles** (`agent.NewTool` / `agent.NewRunTool`):
-  - `NewTool[Args](name, desc, func(restate.Context, Args) (any, error))` — a
-    *context tool*: holds the live `restate.Context` (durable timers, service
-    calls, state). Runs SEQUENTIALLY within a `Promise.all` batch.
-  - `NewRunTool[Args](name, desc, func(restate.RunContext, Args) (any, error))` — a
-    *run tool*: one durable step the agent wraps in `restate.RunAsync`, so a
-    `Promise.all` over run-tools runs durably IN PARALLEL.
-  Both auto-reflect the arg JSON Schema from `Args` (honoring `json:`/`jsonschema:`
-  tags) and surface it to the model in the system prompt.
+- **One tool type, minted two ways** (`agent.NewTool` / `agent.NewSeqTool`). The
+  model can't tell them apart; the difference is only *how the future is produced*,
+  and the batch driver treats every future identically. The design rationale (why
+  "a tool is a single durable op", and why a sequence needs its own invocation) is
+  in `DESIGN.md`.
+  - `NewTool[A,R](name, desc, func(restate.Context, A) (agent.Future[R], error))` —
+    a **leaf** tool: its body performs ONE non-blocking submission and returns the
+    `Future[R]`, built ONLY via `agent.Run` (side effect → `RunAsync`), `agent.Call`
+    /`agent.CallObject` (service call → `RequestFuture`), `agent.Timer` (durable
+    timer → `After`), or `agent.Awakeable`. A `Promise.all` of leaf tools runs
+    durably IN PARALLEL, in-process (submit-all → one `restate.Wait` → read by index).
+  - `NewSeqTool[A,R](name, desc, func(restate.Context, A) (R, error))` — a
+    **sequence** tool: an ordinary blocking, multi-step handler with the full
+    `restate.Context` (data-dependent steps, nested runs, timers, service calls,
+    awakeables). It runs in its own sub-invocation via the keyless `AgentTools/Exec`
+    handler, so it may block/orchestrate freely AND still parallelize with sibling
+    tools — at the cost of one invocation hop. Seq tools are **session-stateless**
+    (pass state via args) and must **not** call back into their own `Agent/<key>`
+    (the parent holds that lock while awaiting them → deadlock).
+  Both auto-reflect the arg JSON Schema from `A` **and** the result schema from `R`
+  (honoring `json:`/`jsonschema:` tags) and surface both to the model.
 - **Sessions:** the service is a Restate **Virtual Object** keyed by session id.
   `Ask` loads the transcript from state (`restate.Get`), runs the loop continuing
   from prior context, and persists it (`restate.Set`) on success only.
@@ -141,9 +163,35 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
   freezes the WASI clock/rand via wazero `WithWalltime`/`WithRandSource`). In
   production the seed = `restate.Rand(ctx).Int64()` and the clock is captured once
   in a journaled `restate.Run`. `TestReplayDeterminism` guards this.
-- **Parallel tools:** `restateInvoker.InvokeBatch` must SUBMIT all `RunAsync`
-  calls first, THEN await (via `restate.Wait`). Awaiting inside the submission
-  loop would serialize them. This two-loop shape is required.
+- **Parallel tools:** `restateInvoker.InvokeBatch` must SUBMIT every call first
+  (each `submit` is non-blocking — a leaf `Run`/`Call`/`Timer` or a seq
+  `RequestFuture` to `AgentTools/Exec`), THEN drive them all with one `restate.Wait`,
+  THEN read results BY INDEX (not completion order). Blocking inside the submission
+  loop — or reading in yield order — would serialize or misorder them. This
+  submit-all → one-Wait → read-by-index shape is required, and it's why a leaf
+  tool's body must NOT block before returning its `Future` (it must only submit).
+- **Cancellation is fatal, not a tool failure:** `InvokeBatch` captures the
+  `TerminalError` that `restate.Wait` yields on a Restate cancellation and
+  `panic(fatalError{...})`; `Engine.Run`'s recover preserves it verbatim and
+  `RunAgent` returns any *terminal* `RunProgram` error immediately (does NOT feed it
+  back). Otherwise a cancellation would be demoted to per-tool rejected promises a
+  defensive program could swallow, "succeeding" a cancelled turn and persisting
+  state. Ordinary tool failures arrive as *non-terminal* program errors and are still
+  fed back for self-correction. A leaf tool that returns a zero-value `Future{}` is
+  rejected at `submit` with a terminal error (never a nil-panic-then-retry-forever).
+- **Pooled instances, EXCLUSIVE checkout:** guest instances are reused across Runs
+  from a pool (`Engine.free`), not instantiated per Run — this removed ~10 MB/Run of
+  allocation churn (now ~82 KB/Run). The guest is single-threaded and NOT reentrant,
+  so reuse is safe ONLY because each instance is checked out by exactly one Run at a
+  time (`acquire`/`release`): never hand one instance to two goroutines. Two things
+  make reuse correct: (1) the guest resets on every `eval_code` — a FRESH `JSContext`
+  per run, so one program's globals/prototype edits can't leak into the next
+  (`TestPoolReuseIsolation` guards this); (2) the host `guest_dealloc`s its per-run
+  buffers so they don't accumulate. An instance is RETIRED (not returned to the pool)
+  if the Run trapped/timed out, served `maxRunsPerInstance`, or grew past
+  `instanceMemHighWater`. New instances are instantiated with `context.Background()`
+  so their lifetime isn't tied to a Run's (cancellable) ctx; only the guest CALLS
+  carry the per-Run ctx (timeout + `runState`).
 - **No infinite retries:** deterministic give-ups (`ErrMaxRounds`) are returned as
   *terminal* errors by `Ask` (`restate.ToTerminalError`). A non-terminal error
   would make Restate retry the same deterministic failure forever.
@@ -152,9 +200,11 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
 - **Safety:** wazero runtime built with `WithCloseOnContextDone(true)` +
   `WithMemoryLimitPages` (256 MiB); per-program timeout via `Sandbox.SetProgramTimeout`
   (a runaway `while(true)` is interrupted → error fed back). The guest also sets
-  `JS_SetMemoryLimit`/`JS_SetMaxStackSize` and guards `MAX_PENDING` (4096; overflow
-  rejects the promise instead of stranding it). Guest traps are recovered into
-  errors in `Engine.Run` (call1 panics → recover → error), never crashing the goroutine.
+  `JS_SetMemoryLimit`/`JS_SetMaxStackSize`. Its pending-promise list GROWS on demand
+  (no arbitrary cap on legitimate `Promise.all` fan-out) with a high safety ceiling
+  `PENDING_MAX` (2^20) that rejects cleanly, and it frees promise capabilities on
+  reset (reuse-safe). Guest traps are recovered into errors in `Engine.Run` (call1
+  panics → recover → error), never crashing the goroutine.
 - **math/rand/v2:** `restate.Rand(ctx)` returns a `*math/rand/v2.Rand` → use
   `.Int64()`, NOT `.Int63()`.
 - **Model context is bounded** (loop.go): each observation is clipped to
@@ -182,7 +232,24 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
   clean; gofmt clean.
 - **The whole design was adversarially audited** (a 4-dimension review + verify
   pass); all confirmed findings are fixed (infinite-retry, runaway hang, memory
-  cap, self-correction, tool-JSON validation, MAX_PENDING overflow).
+  cap, self-correction, tool-JSON validation, pending overflow).
+- **Guest rewritten in Rust (`guest-rs/`, rquickjs) and instances are pooled.** The
+  active guest is now `guest-rs/` (`rquickjs` → `wasm32-wasip1`, ~656 KB vs the 976 KB
+  C guest); the C guest in `guest/` is superseded but kept for reference. Both share
+  the exact same ABI, and the ENTIRE offline suite passes against the Rust guest.
+  Pooling (reuse with exclusive checkout + fresh `JSContext` per run) cut per-round
+  allocation **~10 MB → ~82 KB (≈120×)** — measured in `bench_test.go`; latency is
+  unchanged in practice (~1 ms, ≪ the LLM call). This was done to kill GC churn under
+  concurrent sessions, which the benchmark had flagged as the one real pooling driver.
+- **The Rust guest + pool were adversarially reviewed** (5 dimensions + verify). Fixed:
+  (1) the microtask drain now continues past a throwing job, so leftover jobs can't
+  run against the next pooled run's freed context (a use-after-free — the job queue
+  lives on the persistent Runtime); (2) the `Date` freeze is no longer escapable via
+  `.constructor`; (3) `lcgReader` is non-mutating (WASI rand stays reuse-stable);
+  (4) `guest_alloc(0)` no longer leaks. Guarded by `TestPoolReuseAfterThrowingMicrotask`
+  / `TestDateFreezeNotEscapableViaConstructor` / `TestPoolReuseIsolation`. Known
+  remaining gap (pre-existing, not pooling-specific): `Engine.Close` doesn't drain
+  in-flight Runs — part of the "no graceful shutdown" limitation.
 - **`compute` tool** uses a toy `evalSimple` (single `a*b`/`a+b` only) — it's a
   demo tool; replace with real capabilities.
 - **Not committed to git** yet (was untracked in the sdk-embedded repo).
