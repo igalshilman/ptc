@@ -41,47 +41,49 @@ type countOut struct {
 }
 
 type resolveIn struct {
-	ID    string          `json:"id" jsonschema:"description=the awakeable id to complete (from the awakeable tool's log)"`
-	Value json.RawMessage `json:"value,omitempty" jsonschema:"description=the JSON value to resolve it with"`
+	Invocation string          `json:"invocation" jsonschema:"description=the invocation id awaiting the signal (from the signal tool's log)"`
+	Name       string          `json:"name" jsonschema:"description=the signal name to complete"`
+	Value      json.RawMessage `json:"value,omitempty" jsonschema:"description=the JSON value to resolve it with"`
 }
 type rejectIn struct {
-	ID     string `json:"id" jsonschema:"description=the awakeable id to reject"`
-	Reason string `json:"reason,omitempty" jsonschema:"description=why it is being rejected"`
+	Invocation string `json:"invocation" jsonschema:"description=the invocation id awaiting the signal"`
+	Name       string `json:"name" jsonschema:"description=the signal name to reject"`
+	Reason     string `json:"reason,omitempty" jsonschema:"description=why it is being rejected"`
 }
 type okOut struct {
 	OK bool `json:"ok"`
 }
 
-// awakeablesService resolves/rejects awaitables by id. These are ORDINARY handlers,
-// not seq tools: each has the full restate.Context, so it can issue the ctx-level
-// ResolveAwakeable / RejectAwakeable command, and calling it (a durable service call)
-// gives the caller a future — so discovery exposes them as plain leaf tools with no
-// AgentTools/Exec sub-invocation. By id they can complete an awaitable awaited by
-// ANOTHER session.
-func awakeablesService() restate.ServiceDefinition {
-	return restate.NewService("Awakeables").
+// signalsService resolves/rejects NAMED signals on a target invocation. These are
+// ORDINARY handlers, not seq tools: each has the full restate.Context (so it can issue
+// the ctx-level ResolveSignal / RejectSignal command), and calling one is a durable
+// service call that gives the caller a future — so discovery exposes them as plain leaf
+// tools, no AgentTools/Exec sub-invocation. By (invocation, name) they complete a
+// signal awaited by ANOTHER session (e.g. the one blocked in the `signal` tool).
+func signalsService() restate.ServiceDefinition {
+	return restate.NewService("Signals").
 		Handler("resolve", restate.NewServiceHandler(
 			func(ctx restate.Context, in resolveIn) (okOut, error) {
-				if in.ID == "" {
-					return okOut{}, restate.TerminalErrorf("resolve needs an awakeable id")
+				if in.Invocation == "" || in.Name == "" {
+					return okOut{}, restate.TerminalErrorf("resolve needs an invocation id and signal name")
 				}
 				v := in.Value
 				if len(v) == 0 {
 					v = json.RawMessage("null")
 				}
-				restate.ResolveAwakeable(ctx, in.ID, v)
+				restate.ResolveSignal(ctx, in.Invocation, in.Name, v)
 				return okOut{OK: true}, nil
 			}, restate.WithMetadata(agent.AgentToolAnnotation, "resolve"))).
 		Handler("reject", restate.NewServiceHandler(
 			func(ctx restate.Context, in rejectIn) (okOut, error) {
-				if in.ID == "" {
-					return okOut{}, restate.TerminalErrorf("reject needs an awakeable id")
+				if in.Invocation == "" || in.Name == "" {
+					return okOut{}, restate.TerminalErrorf("reject needs an invocation id and signal name")
 				}
 				reason := in.Reason
 				if reason == "" {
 					reason = "rejected"
 				}
-				restate.RejectAwakeable(ctx, in.ID, errors.New(reason))
+				restate.RejectSignal(ctx, in.Invocation, in.Name, errors.New(reason))
 				return okOut{OK: true}, nil
 			}, restate.WithMetadata(agent.AgentToolAnnotation, "reject")))
 }

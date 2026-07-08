@@ -105,6 +105,15 @@ func Awakeable[R any](ctx restate.Context, opts ...restate.AwakeableOption) (Fut
 	return Future[R]{sel: aw, get: func() (R, error) { return aw.Result() }}, aw.Id()
 }
 
+// Signal returns a leaf future for a NAMED signal on this invocation. It resolves when
+// an external caller completes the signal via restate.ResolveSignal/RejectSignal,
+// addressing it by this invocation's id (ctx.Request().ID) and the given name. Unlike
+// Awakeable, the name is caller-chosen rather than a system-generated id.
+func Signal[R any](ctx restate.Context, name string, opts ...restate.SignalOption) Future[R] {
+	f := restate.Signal[R](ctx, name, opts...)
+	return Future[R]{sel: f, get: func() (R, error) { return f.Result() }}
+}
+
 // NewTool registers a LEAF tool: its body performs ONE non-blocking submission and
 // returns the resulting Future. The arg schema is reflected from A and the result
 // schema from R (both surfaced to the model); raw args are unmarshaled into A. A
