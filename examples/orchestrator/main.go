@@ -31,17 +31,16 @@ import (
 func main() {
 	agent.Main(agent.RunConfig{
 		// Co-deploy demo target services (their handlers are annotated for discovery)
-		// so the standalone agent has something to discover.
-		Extra: []restate.ServiceDefinition{echoService(), counterService()},
+		// so the standalone agent has something to discover — including Awakeables,
+		// whose resolve/reject handlers replace what used to be seq tools.
+		Extra: []restate.ServiceDefinition{echoService(), counterService(), awakeablesService()},
 		// Discover annotated handlers from the Admin API, lazily, per Ask.
 		Discover: &agent.DiscoverConfig{AdminURL: os.Getenv("RESTATE_ADMIN_URL")},
-		// The raw Restate primitives, always available alongside discovered handlers.
+		// The two primitives that aren't just handler calls (durable timer + awaitable).
 		Tools: func(_ openai.Client, _ string) []agent.Tool {
 			return []agent.Tool{
 				sleepTool(),
 				awakeableTool(),
-				resolveTool(),
-				rejectTool(),
 			}
 		},
 	})

@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
+
 	restate "github.com/restatedev/sdk-go"
 
 	"restatedev/agent"
@@ -35,6 +38,52 @@ type addIn struct {
 }
 type countOut struct {
 	Count int `json:"count"`
+}
+
+type resolveIn struct {
+	ID    string          `json:"id" jsonschema:"description=the awakeable id to complete (from the awakeable tool's log)"`
+	Value json.RawMessage `json:"value,omitempty" jsonschema:"description=the JSON value to resolve it with"`
+}
+type rejectIn struct {
+	ID     string `json:"id" jsonschema:"description=the awakeable id to reject"`
+	Reason string `json:"reason,omitempty" jsonschema:"description=why it is being rejected"`
+}
+type okOut struct {
+	OK bool `json:"ok"`
+}
+
+// awakeablesService resolves/rejects awaitables by id. These are ORDINARY handlers,
+// not seq tools: each has the full restate.Context, so it can issue the ctx-level
+// ResolveAwakeable / RejectAwakeable command, and calling it (a durable service call)
+// gives the caller a future — so discovery exposes them as plain leaf tools with no
+// AgentTools/Exec sub-invocation. By id they can complete an awaitable awaited by
+// ANOTHER session.
+func awakeablesService() restate.ServiceDefinition {
+	return restate.NewService("Awakeables").
+		Handler("resolve", restate.NewServiceHandler(
+			func(ctx restate.Context, in resolveIn) (okOut, error) {
+				if in.ID == "" {
+					return okOut{}, restate.TerminalErrorf("resolve needs an awakeable id")
+				}
+				v := in.Value
+				if len(v) == 0 {
+					v = json.RawMessage("null")
+				}
+				restate.ResolveAwakeable(ctx, in.ID, v)
+				return okOut{OK: true}, nil
+			}, restate.WithMetadata(agent.AgentToolAnnotation, "resolve"))).
+		Handler("reject", restate.NewServiceHandler(
+			func(ctx restate.Context, in rejectIn) (okOut, error) {
+				if in.ID == "" {
+					return okOut{}, restate.TerminalErrorf("reject needs an awakeable id")
+				}
+				reason := in.Reason
+				if reason == "" {
+					reason = "rejected"
+				}
+				restate.RejectAwakeable(ctx, in.ID, errors.New(reason))
+				return okOut{OK: true}, nil
+			}, restate.WithMetadata(agent.AgentToolAnnotation, "reject")))
 }
 
 // Counter is a keyed Virtual Object: each key holds its own durable count.
