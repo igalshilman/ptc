@@ -11,8 +11,8 @@
 //   - AUTO-DISCOVERED handler tools: every handler annotated with
 //     restate.WithMetadata(agent.AgentToolAnnotation, "<name>") becomes a tool,
 //     discovered from the Admin API — here reserve_stock (keyed Inventory), risk_score
-//     (RiskCheck), charge_payment (Payments), and resolve/reject (Signals). No manual
-//     wiring; see services.go.
+//     (RiskCheck), charge_payment (Payments), plus resolve/reject from the framework's
+//     own AgentTools service. No manual wiring; see services.go.
 //
 //   - The two RESTATE PRIMITIVES that aren't just handler calls, as static tools:
 //     sleep (durable timer) and signal (create + await a named external signal).
@@ -20,9 +20,8 @@
 //     OPENAI_API_KEY=sk-...  go run ./examples/orchestrator   # serves on :9080
 //
 // Discovery runs LAZILY on each Ask (journaled for replay), not at startup — so it
-// works even for the co-deployed back-office here (Inventory, RiskCheck, Payments,
-// Signals), which register alongside the agent and aren't visible until after it is
-// registered.
+// works even for the co-deployed back-office here (Inventory, RiskCheck, Payments),
+// which registers alongside the agent and isn't visible until after it is registered.
 // New annotated services deployed between turns are picked up on the next Ask.
 //
 // Env: RESTATE_ADMIN_URL (default http://localhost:9070), AGENT_ADDR (default :9080),
@@ -41,13 +40,12 @@ import (
 func main() {
 	agent.Main(agent.RunConfig{
 		// Co-deploy the order-fulfillment back-office (handlers annotated for discovery)
-		// so the standalone agent has real services to orchestrate — including Signals,
-		// whose resolve/reject handlers complete a named signal by (invocation, name).
+		// so the standalone agent has real services to orchestrate. Signal resolve/reject
+		// tools come from the framework's AgentTools service, not from here.
 		Extra: []restate.ServiceDefinition{
 			inventoryService(),
 			riskCheckService(),
 			paymentsService(),
-			signalsService(),
 		},
 		// Discover annotated handlers from the Admin API, lazily, per Ask.
 		Discover: &agent.DiscoverConfig{AdminURL: os.Getenv("RESTATE_ADMIN_URL")},

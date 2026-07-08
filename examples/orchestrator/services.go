@@ -1,8 +1,6 @@
 package main
 
 import (
-	"encoding/json"
-	"errors"
 	"fmt"
 
 	restate "github.com/restatedev/sdk-go"
@@ -19,11 +17,11 @@ import (
 //   - Inventory (keyed Virtual Object)  reserve_stock   — reserve units of a SKU
 //   - RiskCheck (Service)               risk_score      — score an order for review
 //   - Payments  (Service)               charge_payment  — charge a customer
-//   - Signals   (Service)               resolve/reject  — complete a human-approval signal
 //
-// In real use you'd annotate handlers across your own services and point the agent at
-// them; these keep the demo self-contained. Agent/AgentTools are unannotated and never
-// exposed.
+// The signal-completion tools (resolve/reject) are NOT defined here — they're handlers
+// on the framework's own AgentTools service (see agent/service.go), discovered the same
+// way. In real use you'd annotate handlers across your own services and point the agent
+// at them; these keep the demo self-contained.
 
 // ---- Inventory: keyed Virtual Object, one stock count per SKU ---------------
 
@@ -118,53 +116,4 @@ func paymentsService() restate.ServiceDefinition {
 				ctx.Log().Info("charged", "customer", in.Customer, "amount", in.Amount, "txn", txn)
 				return chargeOut{TxnID: txn, Charged: in.Amount}, nil
 			}, restate.WithMetadata(agent.AgentToolAnnotation, "charge_payment")))
-}
-
-// ---- Signals: complete a named human-approval signal by (invocation, name) --
-
-type resolveIn struct {
-	Invocation string          `json:"invocation" jsonschema:"description=the invocation id awaiting the signal (from the signal tool's log)"`
-	Name       string          `json:"name" jsonschema:"description=the signal name to complete"`
-	Value      json.RawMessage `json:"value,omitempty" jsonschema:"description=the JSON value to resolve it with"`
-}
-type rejectIn struct {
-	Invocation string `json:"invocation" jsonschema:"description=the invocation id awaiting the signal"`
-	Name       string `json:"name" jsonschema:"description=the signal name to reject"`
-	Reason     string `json:"reason,omitempty" jsonschema:"description=why it is being rejected"`
-}
-type okOut struct {
-	OK bool `json:"ok"`
-}
-
-// signalsService resolves/rejects NAMED signals on a target invocation. Ordinary
-// handlers (full restate.Context, so they can issue the ctx-level ResolveSignal /
-// RejectSignal command), discovered as plain leaf tools — no AgentTools/Exec. By
-// (invocation, name) they complete a signal awaited by ANOTHER session (the one
-// blocked in the `signal` tool waiting for approval).
-func signalsService() restate.ServiceDefinition {
-	return restate.NewService("Signals").
-		Handler("resolve", restate.NewServiceHandler(
-			func(ctx restate.Context, in resolveIn) (okOut, error) {
-				if in.Invocation == "" || in.Name == "" {
-					return okOut{}, restate.TerminalErrorf("resolve needs an invocation id and signal name")
-				}
-				v := in.Value
-				if len(v) == 0 {
-					v = json.RawMessage("null")
-				}
-				restate.ResolveSignal(ctx, in.Invocation, in.Name, v)
-				return okOut{OK: true}, nil
-			}, restate.WithMetadata(agent.AgentToolAnnotation, "resolve"))).
-		Handler("reject", restate.NewServiceHandler(
-			func(ctx restate.Context, in rejectIn) (okOut, error) {
-				if in.Invocation == "" || in.Name == "" {
-					return okOut{}, restate.TerminalErrorf("reject needs an invocation id and signal name")
-				}
-				reason := in.Reason
-				if reason == "" {
-					reason = "rejected"
-				}
-				restate.RejectSignal(ctx, in.Invocation, in.Name, errors.New(reason))
-				return okOut{OK: true}, nil
-			}, restate.WithMetadata(agent.AgentToolAnnotation, "reject")))
 }

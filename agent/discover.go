@@ -19,7 +19,7 @@ import (
 type DiscoverConfig struct {
 	AdminURL string   // Restate Admin API base URL (default http://localhost:9070)
 	Allow    []string // if non-empty, only these service names become tools
-	Deny     []string // service names to skip (Agent/AgentTools are always skipped)
+	Deny     []string // service names to skip (the Agent session object is always skipped)
 }
 
 // AgentToolAnnotation is the handler-metadata key that opts a handler in to agent
@@ -73,7 +73,10 @@ func fetchHandlers(ctx context.Context, cfg DiscoverConfig) ([]handlerDescriptor
 	if err != nil {
 		return nil, err
 	}
-	deny := map[string]bool{agentObjectService: true, agentToolsService: true}
+	// The Agent session object is never exposed (calling your own session deadlocks).
+	// AgentTools is NOT denied: its Exec handler is unannotated so the annotation gate
+	// skips it, while its annotated resolve/reject handlers are meant to be discovered.
+	deny := map[string]bool{agentObjectService: true}
 	for _, d := range cfg.Deny {
 		deny[d] = true
 	}

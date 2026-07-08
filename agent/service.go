@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -80,17 +81,66 @@ func (s *Service) Close(ctx context.Context) error { return s.engine.Close(ctx) 
 //
 //   - "Agent" (Virtual Object): the session — Ask (drive a turn), History (read
 //     transcript), Reset (clear).
-//   - "AgentTools" (keyless service): a single Exec handler that runs a seq tool's
-//     multi-step body in its own sub-invocation, so seq tools may block/orchestrate
-//     freely and still parallelize with sibling tools in a Promise.all batch.
+//   - "AgentTools" (keyless service): the agent's companion service.
+//   - Exec — runs a seq tool's multi-step body in its own sub-invocation (so seq
+//     tools may block/orchestrate and still parallelize with siblings). Not
+//     annotated, so discovery ignores it.
+//   - resolve / reject — complete a named signal by (invocation, name). Annotated
+//     with AgentToolAnnotation, so a discovering agent gets them as tools (that's
+//     how the `signal` tool's approval is completed), without any bespoke service.
 func (s *Service) Definitions() []restate.ServiceDefinition {
 	agent := restate.NewObject("Agent").
 		Handler("Ask", restate.NewObjectHandler(s.Ask)).
 		Handler("History", restate.NewObjectSharedHandler(s.History)).
 		Handler("Reset", restate.NewObjectHandler(s.Reset))
 	tools := restate.NewService(agentToolsService).
-		Handler(execMethod, restate.NewServiceHandler(s.execTool))
+		Handler(execMethod, restate.NewServiceHandler(s.execTool)).
+		Handler("resolve", restate.NewServiceHandler(resolveSignal, restate.WithMetadata(AgentToolAnnotation, "resolve"))).
+		Handler("reject", restate.NewServiceHandler(rejectSignal, restate.WithMetadata(AgentToolAnnotation, "reject")))
 	return []restate.ServiceDefinition{agent, tools}
+}
+
+// Signal-completion handlers on AgentTools. resolve/reject a named signal on a target
+// invocation (the one blocked in the `signal` tool); each has the full restate.Context
+// to issue the ctx-level command, and calling one is a durable service call — so
+// discovery exposes them as plain leaf tools.
+
+type signalResolveInput struct {
+	Invocation string          `json:"invocation" jsonschema:"description=the invocation id awaiting the signal (from the signal tool's log)"`
+	Name       string          `json:"name" jsonschema:"description=the signal name to complete"`
+	Value      json.RawMessage `json:"value,omitempty" jsonschema:"description=the JSON value to resolve it with"`
+}
+type signalRejectInput struct {
+	Invocation string `json:"invocation" jsonschema:"description=the invocation id awaiting the signal"`
+	Name       string `json:"name" jsonschema:"description=the signal name to reject"`
+	Reason     string `json:"reason,omitempty" jsonschema:"description=why it is being rejected"`
+}
+type signalOK struct {
+	OK bool `json:"ok"`
+}
+
+func resolveSignal(ctx restate.Context, in signalResolveInput) (signalOK, error) {
+	if in.Invocation == "" || in.Name == "" {
+		return signalOK{}, restate.TerminalErrorf("resolve needs an invocation id and signal name")
+	}
+	v := in.Value
+	if len(v) == 0 {
+		v = json.RawMessage("null")
+	}
+	restate.ResolveSignal(ctx, in.Invocation, in.Name, v)
+	return signalOK{OK: true}, nil
+}
+
+func rejectSignal(ctx restate.Context, in signalRejectInput) (signalOK, error) {
+	if in.Invocation == "" || in.Name == "" {
+		return signalOK{}, restate.TerminalErrorf("reject needs an invocation id and signal name")
+	}
+	reason := in.Reason
+	if reason == "" {
+		reason = "rejected"
+	}
+	restate.RejectSignal(ctx, in.Invocation, in.Name, errors.New(reason))
+	return signalOK{OK: true}, nil
 }
 
 // execReq dispatches one seq-tool call to its registered body.
