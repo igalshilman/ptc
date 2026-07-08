@@ -3,42 +3,124 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	restate "github.com/restatedev/sdk-go"
 
 	"restatedev/agent"
 )
 
-// Two demo target services, co-deployed with the agent so the standalone orchestrator
-// has something to discover: a plain Service (Echo) and a keyed Virtual Object
-// (Counter). Their handlers are ANNOTATED via restate.WithMetadata(agent.AgentToolAnnotation,
-// …) — that opt-in marker is what discovery filters on — so they become tools (Echo/echo
-// via agent.Call, Counter/* via agent.CallObject with a {key, input} arg). In real use you
-// would annotate handlers across your own services and point the agent at them; these
-// keep the demo runnable. The Agent/AgentTools handlers are NOT annotated, so they are
-// never exposed to the model.
+// A small order-fulfillment back-office, co-deployed with the agent. Each handler is
+// ANNOTATED with restate.WithMetadata(agent.AgentToolAnnotation, "<toolName>") — that
+// opt-in marker is what discovery filters on — so the agent discovers them as tools
+// (by the annotated name) and orchestrates them via generated code, in parallel and
+// durably, with no manual wiring:
+//
+//   - Inventory (keyed Virtual Object)  reserve_stock   — reserve units of a SKU
+//   - RiskCheck (Service)               risk_score      — score an order for review
+//   - Payments  (Service)               charge_payment  — charge a customer
+//   - Signals   (Service)               resolve/reject  — complete a human-approval signal
+//
+// In real use you'd annotate handlers across your own services and point the agent at
+// them; these keep the demo self-contained. Agent/AgentTools are unannotated and never
+// exposed.
 
-type echoIn struct {
-	Message string `json:"message"`
+// ---- Inventory: keyed Virtual Object, one stock count per SKU ---------------
+
+type reserveIn struct {
+	Qty int `json:"qty" jsonschema:"description=how many units to reserve"`
 }
-type echoOut struct {
-	Echo string `json:"echo"`
+type reserveOut struct {
+	SKU       string `json:"sku"`
+	Reserved  int    `json:"reserved"`
+	Remaining int    `json:"remaining"`
+	OK        bool   `json:"ok"`
 }
 
-func echoService() restate.ServiceDefinition {
-	return restate.NewService("Echo").
-		Handler("echo", restate.NewServiceHandler(
-			func(ctx restate.Context, in echoIn) (echoOut, error) {
-				return echoOut{Echo: "you said: " + in.Message}, nil
-			}, restate.WithMetadata(agent.AgentToolAnnotation, "echo")))
+func inventoryService() restate.ServiceDefinition {
+	const stockKey, seededKey, initialStock = "stock", "seeded", 100
+	return restate.NewObject("Inventory").
+		Handler("reserve", restate.NewObjectHandler(
+			func(ctx restate.ObjectContext, in reserveIn) (reserveOut, error) {
+				sku := restate.Key(ctx)
+				seeded, err := restate.Get[bool](ctx, seededKey)
+				if err != nil {
+					return reserveOut{}, err
+				}
+				if !seeded { // first touch of this SKU: seed initial stock
+					restate.Set(ctx, stockKey, initialStock)
+					restate.Set(ctx, seededKey, true)
+				}
+				remaining, err := restate.Get[int](ctx, stockKey)
+				if err != nil {
+					return reserveOut{}, err
+				}
+				ok := in.Qty > 0 && in.Qty <= remaining
+				reserved := 0
+				if ok {
+					reserved = in.Qty
+					remaining -= reserved
+					restate.Set(ctx, stockKey, remaining)
+				}
+				return reserveOut{SKU: sku, Reserved: reserved, Remaining: remaining, OK: ok}, nil
+			}, restate.WithMetadata(agent.AgentToolAnnotation, "reserve_stock")))
 }
 
-type addIn struct {
-	Amount int `json:"amount"`
+// ---- RiskCheck: score an order, flag large ones for review -----------------
+
+type scoreIn struct {
+	Customer string  `json:"customer" jsonschema:"description=the customer id"`
+	Amount   float64 `json:"amount" jsonschema:"description=the order total in dollars"`
 }
-type countOut struct {
-	Count int `json:"count"`
+type scoreOut struct {
+	Score   int    `json:"score"`
+	Flagged bool   `json:"flagged"`
+	Reason  string `json:"reason"`
 }
+
+func riskCheckService() restate.ServiceDefinition {
+	return restate.NewService("RiskCheck").
+		Handler("score", restate.NewServiceHandler(
+			func(ctx restate.Context, in scoreIn) (scoreOut, error) {
+				score := int(in.Amount / 20) // toy heuristic: larger orders score higher
+				flagged := in.Amount >= 1000
+				reason := "within auto-approval limit"
+				if flagged {
+					reason = "order total >= $1000 — needs human approval"
+				}
+				return scoreOut{Score: score, Flagged: flagged, Reason: reason}, nil
+			}, restate.WithMetadata(agent.AgentToolAnnotation, "risk_score")))
+}
+
+// ---- Payments: charge a customer -------------------------------------------
+
+type chargeIn struct {
+	Customer string  `json:"customer" jsonschema:"description=the customer to charge"`
+	Amount   float64 `json:"amount" jsonschema:"description=the amount to charge in dollars"`
+}
+type chargeOut struct {
+	TxnID   string  `json:"txn_id"`
+	Charged float64 `json:"charged"`
+}
+
+func paymentsService() restate.ServiceDefinition {
+	return restate.NewService("Payments").
+		Handler("charge", restate.NewServiceHandler(
+			func(ctx restate.Context, in chargeIn) (chargeOut, error) {
+				if in.Amount <= 0 {
+					return chargeOut{}, restate.TerminalErrorf("amount must be positive")
+				}
+				n := restate.Rand(ctx).Int64()
+				if n < 0 {
+					n = -n
+				}
+				txn := fmt.Sprintf("txn-%06d", n%1_000_000)
+				ctx.Log().Info("charged", "customer", in.Customer, "amount", in.Amount, "txn", txn)
+				return chargeOut{TxnID: txn, Charged: in.Amount}, nil
+			}, restate.WithMetadata(agent.AgentToolAnnotation, "charge_payment")))
+}
+
+// ---- Signals: complete a named human-approval signal by (invocation, name) --
 
 type resolveIn struct {
 	Invocation string          `json:"invocation" jsonschema:"description=the invocation id awaiting the signal (from the signal tool's log)"`
@@ -54,12 +136,11 @@ type okOut struct {
 	OK bool `json:"ok"`
 }
 
-// signalsService resolves/rejects NAMED signals on a target invocation. These are
-// ORDINARY handlers, not seq tools: each has the full restate.Context (so it can issue
-// the ctx-level ResolveSignal / RejectSignal command), and calling one is a durable
-// service call that gives the caller a future — so discovery exposes them as plain leaf
-// tools, no AgentTools/Exec sub-invocation. By (invocation, name) they complete a
-// signal awaited by ANOTHER session (e.g. the one blocked in the `signal` tool).
+// signalsService resolves/rejects NAMED signals on a target invocation. Ordinary
+// handlers (full restate.Context, so they can issue the ctx-level ResolveSignal /
+// RejectSignal command), discovered as plain leaf tools — no AgentTools/Exec. By
+// (invocation, name) they complete a signal awaited by ANOTHER session (the one
+// blocked in the `signal` tool waiting for approval).
 func signalsService() restate.ServiceDefinition {
 	return restate.NewService("Signals").
 		Handler("resolve", restate.NewServiceHandler(
@@ -86,25 +167,4 @@ func signalsService() restate.ServiceDefinition {
 				restate.RejectSignal(ctx, in.Invocation, in.Name, errors.New(reason))
 				return okOut{OK: true}, nil
 			}, restate.WithMetadata(agent.AgentToolAnnotation, "reject")))
-}
-
-// Counter is a keyed Virtual Object: each key holds its own durable count.
-func counterService() restate.ServiceDefinition {
-	const countKey = "count"
-	return restate.NewObject("Counter").
-		Handler("add", restate.NewObjectHandler(
-			func(ctx restate.ObjectContext, in addIn) (countOut, error) {
-				n, err := restate.Get[int](ctx, countKey)
-				if err != nil {
-					return countOut{}, err
-				}
-				n += in.Amount
-				restate.Set(ctx, countKey, n)
-				return countOut{Count: n}, nil
-			}, restate.WithMetadata(agent.AgentToolAnnotation, "counter_add"))).
-		Handler("get", restate.NewObjectSharedHandler(
-			func(ctx restate.ObjectSharedContext, _ restate.Void) (countOut, error) {
-				n, err := restate.Get[int](ctx, countKey)
-				return countOut{Count: n}, err
-			}, restate.WithMetadata(agent.AgentToolAnnotation, "counter_get")))
 }
