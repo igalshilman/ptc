@@ -221,6 +221,15 @@ func (r *restateInvoker) Tools() []ToolSpec {
 	return specs
 }
 
+// Reset clears leftover in-flight/errored ops from a previous program, so the host's
+// handle space realigns with the guest (which resets its handle counter each start).
+// Abandoned ops (e.g. Promise.race losers) are simply dropped — their durable futures
+// are left in flight (no cleanup, by design).
+func (r *restateInvoker) Reset() {
+	r.pending = map[int]pendingOp{}
+	r.ready = map[int]readyOp{}
+}
+
 // Start submits each new op as an in-flight durable Future (a leaf tool submits
 // in-process via Run/Call/Timer/…; a seq tool is dispatched to its own AgentTools/Exec
 // sub-invocation), keyed by the op's stable handle. An op that can't even be submitted

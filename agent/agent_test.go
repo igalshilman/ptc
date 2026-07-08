@@ -234,6 +234,7 @@ func (m *testInvoker) addWithSchema(name, desc, params string, fn func(context.C
 	m.specs = append(m.specs, spec)
 }
 func (m *testInvoker) Tools() []ToolSpec { return m.specs }
+func (m *testInvoker) Reset()            { m.done = nil }
 func (m *testInvoker) Start(calls []ToolCall) {
 	if m.done == nil {
 		m.done = map[int]StepResult{}
@@ -559,6 +560,7 @@ type recordingInvoker struct {
 }
 
 func (r *recordingInvoker) Tools() []ToolSpec { return r.inner.Tools() }
+func (r *recordingInvoker) Reset()            { r.inner.Reset() }
 func (r *recordingInvoker) Start(calls []ToolCall) {
 	for _, c := range calls {
 		*r.calls = append(*r.calls, c.Tool+"("+string(c.Arg)+")")
@@ -648,6 +650,7 @@ type batchMock struct {
 }
 
 func (b *batchMock) Tools() []ToolSpec { return b.specs }
+func (b *batchMock) Reset()            { b.done = nil }
 func (b *batchMock) Start(calls []ToolCall) {
 	if len(calls) > b.maxBatch {
 		b.maxBatch = len(calls)
@@ -771,6 +774,28 @@ func TestThrowingMicrotaskContained(t *testing.T) {
 	}
 	if got != `{"done":true,"answer":42}` {
 		t.Fatalf("run B got %q", got)
+	}
+}
+
+// TestManyThrowingMicrotasksContained: MANY unhandled throwing microtasks in one
+// program must not free the live guest context. rquickjs 0.9's execute_pending_job
+// returns a JobException that would otherwise unbalance the context refcount, so
+// ~500 throws would free the live context mid-drain (a use-after-free NDEBUG does not
+// prevent). The guest forgets the exception; 2000 >> that threshold, and a reused
+// instance afterward must still work.
+func TestManyThrowingMicrotasksContained(t *testing.T) {
+	eng, ctx := newTestEngine(t)
+	sb := NewSandbox(eng, &testInvoker{})
+	got, err := sb.RunProgram(ctx,
+		`for (let i = 0; i < 2000; i++) queueMicrotask(function () { throw new Error("x"); }); return {done:true, answer: 6*7};`)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if got != `{"done":true,"answer":42}` {
+		t.Fatalf("got %q", got)
+	}
+	if got2, err := sb.RunProgram(ctx, `return 1 + 1;`); err != nil || got2 != "2" {
+		t.Fatalf("reuse after many throwing microtasks: got %q err %v", got2, err)
 	}
 }
 

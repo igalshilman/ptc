@@ -28,6 +28,11 @@ type Invoker interface {
 	// Tools returns the registered tool specs, in a stable order. Names drive the
 	// JS bridge; the full specs (incl. JSON Schema) are surfaced to the model.
 	Tools() []ToolSpec
+	// Reset discards any in-flight/leftover ops from a previous program. The guest
+	// resets its handle counter to 0 on each start(), so the host must clear its
+	// handle-keyed state too — otherwise a prior program's abandoned op (e.g. a
+	// Promise.race loser) would alias a later program's reused handle.
+	Reset()
 	// Start submits new ops as in-flight durable operations, keyed by ToolCall.Handle.
 	// Non-blocking.
 	Start(calls []ToolCall)

@@ -100,8 +100,21 @@ fn drive_and_read() -> Vec<u8> {
         };
         loop {
             match guest.rt.execute_pending_job() {
-                Ok(true) | Err(_) => continue,
+                Ok(true) => continue,
                 Ok(false) => break,
+                Err(e) => {
+                    // rquickjs 0.9 returns a JobException that OWNS the live context but
+                    // was built WITHOUT a balancing JS_DupContext, so dropping it does an
+                    // unbalanced JS_FreeContext (a refcount decrement). Enough throwing
+                    // jobs (e.g. queueMicrotask(() => { throw }) in a loop) would drive
+                    // the LIVE context's refcount to zero and free it mid-drain — a
+                    // use-after-free that NDEBUG does NOT prevent (it only silences the
+                    // teardown assert). Forget it to leak the phantom ref instead of
+                    // decrementing, and keep draining so an unhandled throwing microtask
+                    // stays contained (it is not fatal to the program).
+                    std::mem::forget(e);
+                    continue;
+                }
             }
         }
         let out: String = guest.ctx.with(|ctx| {

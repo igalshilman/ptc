@@ -260,6 +260,7 @@ func (e *Engine) RunLive(ctx context.Context, script string, inv Invoker) (resul
 		e.release(ctx, g, healthy && ctx.Err() == nil)
 	}()
 
+	inv.Reset() // clear any prior program's leftover ops; the guest resets handles per start
 	out, err := g.start(ctx, []byte(script))
 	if err != nil {
 		return "", err
