@@ -12,14 +12,21 @@ import (
 	restate "github.com/restatedev/sdk-go"
 )
 
-// DiscoverConfig configures Admin-API handler discovery: turn EVERY registered
-// handler into a leaf tool the agent can call, so the model can orchestrate an
-// existing deployment's durable handlers (in parallel, durably) via generated code.
+// DiscoverConfig configures Admin-API handler discovery: turn each opted-in handler
+// into a leaf tool the agent can call, so the model can orchestrate an existing
+// deployment's durable handlers (in parallel, durably) via generated code. Only
+// handlers ANNOTATED with AgentToolAnnotation are exposed (opt-in).
 type DiscoverConfig struct {
 	AdminURL string   // Restate Admin API base URL (default http://localhost:9070)
 	Allow    []string // if non-empty, only these service names become tools
 	Deny     []string // service names to skip (Agent/AgentTools are always skipped)
 }
+
+// AgentToolAnnotation is the handler-metadata key that opts a handler in to agent
+// discovery: only handlers whose metadata contains this key become tools. Annotate a
+// handler with restate.WithMetadata(agent.AgentToolAnnotation, "..."). The value is
+// currently ignored for the tool name (reserved for a future custom name).
+const AgentToolAnnotation = "restate/agent"
 
 const (
 	agentObjectService = "Agent"
@@ -79,6 +86,9 @@ func fetchHandlers(ctx context.Context, cfg DiscoverConfig) ([]handlerDescriptor
 		}
 		keyed := s.keyed()
 		for _, h := range s.Handlers {
+			if _, ok := h.Metadata[AgentToolAnnotation]; !ok {
+				continue // opt-in: only handlers annotated with AgentToolAnnotation
+			}
 			out = append(out, handlerDescriptor{
 				Service: s.Name,
 				Handler: h.Name,
@@ -108,10 +118,11 @@ func (s adminService) keyed() bool {
 }
 
 type adminHandler struct {
-	Name             string          `json:"name"`
-	Documentation    string          `json:"documentation"`
-	InputJSONSchema  json.RawMessage `json:"input_json_schema"`
-	OutputJSONSchema json.RawMessage `json:"output_json_schema"`
+	Name             string            `json:"name"`
+	Documentation    string            `json:"documentation"`
+	Metadata         map[string]string `json:"metadata"`
+	InputJSONSchema  json.RawMessage   `json:"input_json_schema"`
+	OutputJSONSchema json.RawMessage   `json:"output_json_schema"`
 }
 
 func fetchServices(ctx context.Context, adminURL string) ([]adminService, error) {

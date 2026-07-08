@@ -10,22 +10,19 @@ import (
 	"restatedev/agent"
 )
 
-// This example exposes Restate's durable PRIMITIVES directly as agent tools, so the
-// model can compose durable workflows in JavaScript: a durable timer, a service call,
-// and an external awaitable (create/resolve/reject). It's the "how far can you push
-// the CodeAct model" showcase — deliberately low-level, unlike examples/research.
-//
-// How each primitive maps to the tool model (see DESIGN.md / CLAUDE.md):
+// The Restate durable PRIMITIVES, exposed as static tools alongside the handlers the
+// agent auto-discovers from the Admin API (see main.go / services.go). Together the
+// model can both call your annotated durable handlers AND compose raw primitives:
 //
 //   - sleep, rpc            → LEAF tools: one non-blocking submission returning a
 //                             durable Future the batch awaits.
 //   - awakeable             → a LEAF tool that CREATES the awaitable and BLOCKS on it in
-//                             one call (returning the resolved value). It is NOT split
-//                             into create-then-await: an awaitable can't be rehydrated
-//                             from a bare id in a later call, and a create-only call has
-//                             no future to await — so create+await in one leaf call is
-//                             the shape that stays replay-safe (on replay the awaitable
-//                             is recreated at the same journal position → same id).
+//                             one call (returning the resolved value). Not split into
+//                             create-then-await: an awaitable can't be rehydrated from a
+//                             bare id later, and a create-only call has no future to
+//                             await — so create+await in one leaf call is what stays
+//                             replay-safe (on replay it is recreated at the same journal
+//                             position → same id).
 //   - resolve, reject       → SEQ tools: resolving/rejecting is a ctx command (not a Run
 //                             side effect), so it runs on the full restate.Context. By
 //                             id, it can signal an awaitable awaited by ANOTHER run.
@@ -41,7 +38,7 @@ type sleepResult struct {
 
 func sleepTool() agent.Tool {
 	return agent.NewTool("sleep",
-		`pause for N seconds; arg {"seconds": number}. Several sleeps in one Promise.all run concurrently, also useful in Promise.race(asleep, somethingElse)`,
+		`pause for N seconds; arg {"seconds": number}. Several sleeps in one Promise.all run concurrently; also useful in Promise.race([work, sleep]) to bound work with a timeout`,
 		func(ctx restate.Context, a sleepArgs) (agent.Future[sleepResult], error) {
 			d := time.Duration(a.Seconds * float64(time.Second))
 			return agent.Timer(ctx, d, sleepResult{SleptSeconds: a.Seconds}, restate.WithName("sleep")), nil
@@ -56,9 +53,12 @@ type rpcArgs struct {
 	Arg     json.RawMessage `json:"arg,omitempty" jsonschema:"description=the JSON argument to pass to the handler"`
 }
 
+// rpcTool is a generic escape hatch: call ANY handler by name (including ones not
+// annotated for discovery). The auto-discovered tools are the ergonomic, schema-typed
+// alternative for annotated handlers.
 func rpcTool() agent.Tool {
 	return agent.NewTool("rpc",
-		`durably call another handler: {service, handler, arg}`,
+		`durably call any handler by name: {service, handler, arg}. Prefer the auto-discovered per-handler tools when one exists`,
 		func(ctx restate.Context, a rpcArgs) (agent.Future[json.RawMessage], error) {
 			if a.Service == "" || a.Handler == "" {
 				return agent.Future[json.RawMessage]{}, restate.TerminalErrorf("rpc needs a service and handler")
@@ -130,23 +130,4 @@ func rejectTool() agent.Tool {
 			restate.RejectAwakeable(ctx, a.ID, errors.New(reason))
 			return okResult{OK: true}, nil
 		})
-}
-
-// ---- Echo: a tiny companion service for the rpc tool to call ----------------
-
-type echoIn struct {
-	Message string `json:"message"`
-}
-type echoOut struct {
-	Echo string `json:"echo"`
-}
-
-// echoService is a trivial Restate service so the rpc tool has a real target,
-// keeping the example self-contained. rpc({service:"Echo", handler:"echo", arg:{message:"hi"}}).
-func echoService() restate.ServiceDefinition {
-	return restate.NewService("Echo").
-		Handler("echo", restate.NewServiceHandler(
-			func(ctx restate.Context, in echoIn) (echoOut, error) {
-				return echoOut{Echo: "you said: " + in.Message}, nil
-			}))
 }
