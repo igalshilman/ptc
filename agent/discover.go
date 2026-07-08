@@ -24,8 +24,9 @@ type DiscoverConfig struct {
 
 // AgentToolAnnotation is the handler-metadata key that opts a handler in to agent
 // discovery: only handlers whose metadata contains this key become tools. Annotate a
-// handler with restate.WithMetadata(agent.AgentToolAnnotation, "..."). The value is
-// currently ignored for the tool name (reserved for a future custom name).
+// handler with restate.WithMetadata(agent.AgentToolAnnotation, "toolName"). The value,
+// if non-empty, becomes the tool's name (sanitized to a JS identifier); otherwise the
+// tool is named <Service>_<handler>. Annotated names should be unique across handlers.
 const AgentToolAnnotation = "restate/agent"
 
 const (
@@ -57,6 +58,7 @@ func DiscoverTools(ctx context.Context, cfg DiscoverConfig) ([]Tool, error) {
 type handlerDescriptor struct {
 	Service string          `json:"service"`
 	Handler string          `json:"handler"`
+	Name    string          `json:"name,omitempty"` // annotation value → tool name (empty = derive)
 	Keyed   bool            `json:"keyed"`
 	Doc     string          `json:"doc,omitempty"`
 	Params  json.RawMessage `json:"params,omitempty"`
@@ -86,12 +88,14 @@ func fetchHandlers(ctx context.Context, cfg DiscoverConfig) ([]handlerDescriptor
 		}
 		keyed := s.keyed()
 		for _, h := range s.Handlers {
-			if _, ok := h.Metadata[AgentToolAnnotation]; !ok {
+			toolName, ok := h.Metadata[AgentToolAnnotation]
+			if !ok {
 				continue // opt-in: only handlers annotated with AgentToolAnnotation
 			}
 			out = append(out, handlerDescriptor{
 				Service: s.Name,
 				Handler: h.Name,
+				Name:    toolName, // annotation value → tool name (empty = derive)
 				Keyed:   keyed,
 				Doc:     h.Documentation,
 				Params:  h.InputJSONSchema,
@@ -170,6 +174,9 @@ func fetchServices(ctx context.Context, adminURL string) ([]adminService, error)
 // submit; deterministic so it rebuilds identically on replay.
 func toolFromDescriptor(d handlerDescriptor) Tool {
 	name := sanitizeName(d.Service + "_" + d.Handler)
+	if strings.TrimSpace(d.Name) != "" {
+		name = sanitizeName(d.Name) // use the annotated name when the annotation gives one
+	}
 	params := d.Params
 	if d.Keyed {
 		params = keyedParams(d.Params)

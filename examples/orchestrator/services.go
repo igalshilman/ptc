@@ -99,10 +99,10 @@ func counterService() restate.ServiceDefinition {
 				n += in.Amount
 				restate.Set(ctx, countKey, n)
 				return countOut{Count: n}, nil
-			}, restate.WithMetadata(agent.AgentToolAnnotation, "add"))).
+			}, restate.WithMetadata(agent.AgentToolAnnotation, "counter_add"))).
 		Handler("get", restate.NewObjectSharedHandler(
 			func(ctx restate.ObjectSharedContext, _ restate.Void) (countOut, error) {
 				n, err := restate.Get[int](ctx, countKey)
 				return countOut{Count: n}, err
-			}, restate.WithMetadata(agent.AgentToolAnnotation, "get")))
+			}, restate.WithMetadata(agent.AgentToolAnnotation, "counter_get")))
 }
