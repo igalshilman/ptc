@@ -88,6 +88,28 @@ func TestLargeFrontier(t *testing.T) {
 	}
 }
 
+// TestPromiseRaceFirstWins: Promise.race settles with the FIRST delivered completion
+// and the program proceeds WITHOUT the loser — the capability the live model exists
+// for (a timeout is race([work, sleep])). The test invoker delivers the lowest handle
+// first, so `a` (handle 0) wins and `b` is abandoned when the program returns.
+func TestPromiseRaceFirstWins(t *testing.T) {
+	eng, ctx := newTestEngine(t)
+	inv := &testInvoker{}
+	inv.add("a", func(_ context.Context, _ json.RawMessage) (json.RawMessage, error) {
+		return json.RawMessage(`"A"`), nil
+	})
+	inv.add("b", func(_ context.Context, _ json.RawMessage) (json.RawMessage, error) {
+		return json.RawMessage(`"B"`), nil
+	})
+	got, err := NewSandbox(eng, inv).RunProgram(ctx, `const r = await Promise.race([a(), b()]); return r;`)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if got != `"A"` {
+		t.Fatalf("race should settle with the first completion (a); got %q", got)
+	}
+}
+
 // TestProgramThrow: a thrown error surfaces as a non-nil RunProgram error.
 func TestProgramThrow(t *testing.T) {
 	eng, ctx := newTestEngine(t)
@@ -187,10 +209,14 @@ func TestConcurrentRunsAreIsolated(t *testing.T) {
 	}
 }
 
-// testInvoker is a minimal in-memory Invoker for sandbox/loop tests.
+// testInvoker is a minimal in-memory Invoker for sandbox/loop tests. Tools run
+// SYNCHRONOUSLY at Start (the real invoker submits durable futures instead); each
+// settled result is buffered by handle and delivered by Next in ascending-handle
+// order, which is deterministic.
 type testInvoker struct {
 	tools map[string]func(context.Context, json.RawMessage) (json.RawMessage, error)
 	specs []ToolSpec
+	done  map[int]StepResult
 }
 
 func (m *testInvoker) add(name string, fn func(context.Context, json.RawMessage) (json.RawMessage, error)) {
@@ -208,13 +234,48 @@ func (m *testInvoker) addWithSchema(name, desc, params string, fn func(context.C
 	m.specs = append(m.specs, spec)
 }
 func (m *testInvoker) Tools() []ToolSpec { return m.specs }
-func (m *testInvoker) InvokeBatch(ctx context.Context, calls []ToolCall) []ToolResult {
-	out := make([]ToolResult, len(calls))
-	for i, c := range calls {
-		v, err := m.tools[c.Tool](ctx, c.Arg)
-		out[i] = ToolResult{Value: v, Err: err}
+func (m *testInvoker) Start(calls []ToolCall) {
+	if m.done == nil {
+		m.done = map[int]StepResult{}
 	}
-	return out
+	for _, c := range calls {
+		m.done[c.Handle] = runTestTool(m.tools[c.Tool], c)
+	}
+}
+func (m *testInvoker) Pending() int                             { return len(m.done) }
+func (m *testInvoker) Next(context.Context) (StepResult, error) { return popLowest(m.done), nil }
+
+// runTestTool executes an in-memory test tool and returns its settled StepResult,
+// mirroring the validation the real invoker's Next does (unknown tool / error /
+// empty → null / invalid JSON → tool-named error).
+func runTestTool(fn func(context.Context, json.RawMessage) (json.RawMessage, error), c ToolCall) StepResult {
+	if fn == nil {
+		return StepResult{Handle: c.Handle, ErrMsg: fmt.Sprintf("unknown tool %q", c.Tool), IsErr: true}
+	}
+	v, err := fn(context.Background(), c.Arg)
+	switch {
+	case err != nil:
+		return StepResult{Handle: c.Handle, ErrMsg: err.Error(), IsErr: true}
+	case len(v) == 0:
+		return StepResult{Handle: c.Handle, Value: json.RawMessage("null")}
+	case !json.Valid(v):
+		return StepResult{Handle: c.Handle, ErrMsg: fmt.Sprintf("tool %q returned invalid JSON", c.Tool), IsErr: true}
+	default:
+		return StepResult{Handle: c.Handle, Value: v}
+	}
+}
+
+// popLowest removes and returns the lowest-handle buffered result (deterministic).
+func popLowest(m map[int]StepResult) StepResult {
+	h := -1
+	for k := range m {
+		if h < 0 || k < h {
+			h = k
+		}
+	}
+	res := m[h]
+	delete(m, h)
+	return res
 }
 
 // scriptModel returns pre-scripted decisions; each step may inspect the convo.
@@ -498,12 +559,14 @@ type recordingInvoker struct {
 }
 
 func (r *recordingInvoker) Tools() []ToolSpec { return r.inner.Tools() }
-func (r *recordingInvoker) InvokeBatch(ctx context.Context, calls []ToolCall) []ToolResult {
+func (r *recordingInvoker) Start(calls []ToolCall) {
 	for _, c := range calls {
 		*r.calls = append(*r.calls, c.Tool+"("+string(c.Arg)+")")
 	}
-	return r.inner.InvokeBatch(ctx, calls)
+	r.inner.Start(calls)
 }
+func (r *recordingInvoker) Pending() int                                 { return r.inner.Pending() }
+func (r *recordingInvoker) Next(ctx context.Context) (StepResult, error) { return r.inner.Next(ctx) }
 
 // TestReplayDeterminism is the core durability guarantee at the integration
 // level: two independent runs (fresh QuickJS instances — as after a crash+replay)
@@ -575,25 +638,34 @@ func TestParallelTools(t *testing.T) {
 	}
 }
 
-// batchMock records the largest batch (frontier) it saw.
+// batchMock records the largest batch (single Start call) it saw — a Promise.all of
+// N tool calls is delivered to Start as one batch of N.
 type batchMock struct {
 	specs    []ToolSpec
 	maxBatch int
 	fn       func(string, json.RawMessage) (json.RawMessage, error)
+	done     map[int]StepResult
 }
 
 func (b *batchMock) Tools() []ToolSpec { return b.specs }
-func (b *batchMock) InvokeBatch(_ context.Context, calls []ToolCall) []ToolResult {
+func (b *batchMock) Start(calls []ToolCall) {
 	if len(calls) > b.maxBatch {
 		b.maxBatch = len(calls)
 	}
-	out := make([]ToolResult, len(calls))
-	for i, c := range calls {
-		v, err := b.fn(c.Tool, c.Arg)
-		out[i] = ToolResult{Value: v, Err: err}
+	if b.done == nil {
+		b.done = map[int]StepResult{}
 	}
-	return out
+	for _, c := range calls {
+		v, err := b.fn(c.Tool, c.Arg)
+		if err != nil {
+			b.done[c.Handle] = StepResult{Handle: c.Handle, ErrMsg: err.Error(), IsErr: true}
+		} else {
+			b.done[c.Handle] = StepResult{Handle: c.Handle, Value: v}
+		}
+	}
 }
+func (b *batchMock) Pending() int                             { return len(b.done) }
+func (b *batchMock) Next(context.Context) (StepResult, error) { return popLowest(b.done), nil }
 
 // TestBatchInvoker: a Promise.all of N tool calls is delivered to InvokeBatch as ONE
 // frontier of N — the hook a durable invoker uses to run them in parallel
@@ -619,7 +691,7 @@ func TestBatchInvoker(t *testing.T) {
 		t.Fatalf("got %q, want 12", got)
 	}
 	if m.maxBatch != 3 {
-		t.Fatalf("expected one batch of 3, InvokeBatch saw max %d", m.maxBatch)
+		t.Fatalf("expected one batch of 3, Start saw max %d", m.maxBatch)
 	}
 }
 
@@ -660,9 +732,9 @@ func TestSession(t *testing.T) {
 }
 
 // TestPoolReuseIsolation: when an instance is reused from the pool, one program's
-// global pollution must NOT be visible to the next. The guest is stateless — a fresh
-// QuickJS runtime per execute call — so isolation is inherent; this guards the
-// correctness/security property pooling depends on.
+// global pollution must NOT be visible to the next. Each program gets a FRESH QuickJS
+// context at start(), so isolation is inherent; this guards the correctness/security
+// property pooling depends on.
 func TestPoolReuseIsolation(t *testing.T) {
 	eng, ctx := newTestEngine(t)
 	sb := NewSandbox(eng, &testInvoker{})
@@ -684,8 +756,8 @@ func TestPoolReuseIsolation(t *testing.T) {
 // TestThrowingMicrotaskContained: a program with an unhandled throwing microtask
 // must not crash the guest (the QuickJS teardown handles it — the guest is built
 // with NDEBUG), and a subsequent run on the same pooled instance must be unaffected.
-// In the re-execution model each execute uses a fresh runtime, so isolation is
-// inherent; this guards against a regression (e.g. a debug-assert abort returning).
+// Each program gets a fresh context at start(), so isolation is inherent; this guards
+// against a regression (e.g. a debug-assert abort returning).
 func TestThrowingMicrotaskContained(t *testing.T) {
 	eng, ctx := newTestEngine(t)
 	sb := NewSandbox(eng, &testInvoker{})

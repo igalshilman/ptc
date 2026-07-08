@@ -1,34 +1,35 @@
-//! QuickJS WASM guest (Rust / rquickjs) — a **stateless, one-shot JS evaluator**.
+//! QuickJS WASM guest (Rust / rquickjs) — a **live, host-driven JS coroutine**.
 //!
-//! It exposes ONE operation: `execute(script)` runs an assembled script (built by
-//! the host in `../agent`) to synchronous quiescence and returns an output blob.
-//! There is **no host import** and **no persistent state** — the guest never calls
-//! back into the host and holds nothing between calls.
+//! The host runs the model's program ONCE and drives it to completion by settling
+//! its promises as durable operations finish. There is **no wasm import** (the guest
+//! never calls the host); instead the host calls these exports and reads a step blob
+//! from each:
 //!
-//! # The replay model (why there are no globals)
+//!   1. `start(script)` — the host assembles `script` = determinism prelude + bridge
+//!      + program and evaluates it. Each tool call the program makes gets a deterministic
+//!      integer HANDLE, records `{handle, name, arg}` in `globalThis.__outbox`, and
+//!      returns a real Promise held in a `handle → {resolve, reject}` map. The program
+//!      runs to synchronous quiescence and `start` returns the outbox as the first step.
+//!   2. The host starts each op as a durable Restate future (handle → future), then
+//!      races them with `WaitFirst`. When the FIRST completes it calls back in:
+//!      `resolve(handle, jsonValue)` or `reject(handle, message)`, which settles that
+//!      one promise (via the bridge's `__resolveJSON` / `__reject`), drives to
+//!      quiescence again, and returns the next step (possibly with new ops).
+//!   3. Repeat until a step reports the program settled: `{s:0, r}` (answer) or
+//!      `{s:2, error}`. A running step is `{s:1, ops:[…]}`.
 //!
-//! This mirrors Restate's own durable execution, one level down. The host does NOT
-//! keep a live, suspended program; instead it **re-executes the program from the
-//! start each round**, feeding in a *journal* of the tool results gathered so far:
+//! # Why a live coroutine (vs. re-execution)
 //!
-//!   1. Host assembles `script` = determinism prelude + tool/journal prelude + the
-//!      program, with the journal injected as `globalThis.__journal`.
-//!   2. `execute(script)`: fresh QuickJS runtime; run the program + drain microtasks.
-//!      Each tool call the program makes is matched by ORDER to `__journal`: an
-//!      already-known call resolves immediately with its recorded result; a NEW call
-//!      is pushed to `globalThis.__frontier` and returns a promise that never
-//!      resolves this run. So the program advances to the first new call, then blocks.
-//!   3. The guest reads the JS-produced output and returns it, then drops everything.
-//!      Output is one of: `{s:0,answer}` (done), `{s:1,frontier:[{name,arg},…]}`
-//!      (needs these calls run), `{s:2,error}`.
-//!   4. Host runs the frontier durably (in parallel — the frontier IS the batch),
-//!      appends the results to the journal, and calls `execute` again.
+//! Settling promises one-at-a-time, in completion order, is exactly how first-completion
+//! (`Promise.race`/`any`/timeouts) works — the losers stay pending. It also mirrors
+//! Restate's own `Select`: on replay the host re-runs `start` and feeds the journaled
+//! completions back in the same order, so the program re-derives identically. The state
+//! lives in the guest for the duration of one program; the host owns durability.
 //!
-//! Because the program is deterministic (the host freezes clock/rand in the
-//! prelude), its tool-call sequence is identical across re-executions, so matching
-//! the journal by position is sound — exactly like Restate replaying a handler.
+//! Determinism: the host freezes clock/rand in the prelude and the handle counter is
+//! deterministic, so the program's operation sequence is identical across replays.
 //!
-//! Modules: [`abi`] = the wire (exports + raw memory); [`engine`] = the evaluator.
+//! Modules: [`abi`] = the wire (exports + raw memory); [`engine`] = the coroutine.
 
 mod abi;
 mod engine;

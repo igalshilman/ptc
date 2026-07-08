@@ -132,7 +132,12 @@ func (s *Service) Ask(ctx restate.ObjectContext, in AskInput) (AskOutput, error)
 	}
 	convo := &Conversation{Turns: append(history, Turn{Role: RoleUser, Content: in.Message})}
 
-	inv := &restateInvoker{rctx: ctx, tools: map[string]Tool{}}
+	inv := &restateInvoker{
+		rctx:    ctx,
+		tools:   map[string]Tool{},
+		pending: map[int]pendingOp{},
+		ready:   map[int]readyOp{},
+	}
 	for _, t := range s.tools {
 		inv.tools[t.Name] = t
 		inv.order = append(inv.order, t.Name)
@@ -185,12 +190,26 @@ func (s *Service) Reset(ctx restate.ObjectContext, _ restate.Void) (restate.Void
 // --- Invoker: dispatches JS tool calls to the registered Tools ---------------
 
 // restateInvoker binds registered tools to the current invocation's context and
-// satisfies Invoker. The context.Context passed to InvokeBatch (carrying no useful
-// state here) is ignored; the tools get the real restate.Context.
+// satisfies Invoker. It tracks in-flight operations by handle across the program's
+// lifetime; the context.Context passed to Next (carrying no useful state) is ignored,
+// the tools get the real restate.Context.
 type restateInvoker struct {
 	rctx  restate.Context
 	tools map[string]Tool
 	order []string
+
+	pending map[int]pendingOp // handle -> in-flight durable future
+	ready   map[int]readyOp   // handle -> op that failed at submit time (settles immediately)
+}
+
+type pendingOp struct {
+	fut  anyFuture
+	name string // tool name, for a clear invalid-JSON error
+}
+
+type readyOp struct {
+	err  error
+	name string
 }
 
 func (r *restateInvoker) Tools() []ToolSpec {
@@ -202,67 +221,80 @@ func (r *restateInvoker) Tools() []ToolSpec {
 	return specs
 }
 
-// InvokeBatch resolves a frontier of tool calls with durable PARALLELISM through a
-// single, uniform driver: submit EVERY call as an in-flight Future (a leaf tool
-// submits in-process via Run/Call/Timer/…; a seq tool is dispatched to its own
-// AgentTools/Exec sub-invocation), then drive them all together with one
-// restate.Wait, then read each result BY INDEX. The driver never inspects the kind
-// of future — that is the whole point. Submissions happen in the deterministic
-// per-invocation order and results are read by index (not completion order), so
-// replay is stable regardless of which future settles first.
-func (r *restateInvoker) InvokeBatch(_ context.Context, calls []ToolCall) []ToolResult {
-	results := make([]ToolResult, len(calls))
-
-	type pending struct {
-		idx int
-		f   anyFuture
-	}
-	var pend []pending
-
-	for i, c := range calls {
+// Start submits each new op as an in-flight durable Future (a leaf tool submits
+// in-process via Run/Call/Timer/…; a seq tool is dispatched to its own AgentTools/Exec
+// sub-invocation), keyed by the op's stable handle. An op that can't even be submitted
+// (unknown tool / bad args) is recorded as immediately-settled. Non-blocking.
+func (r *restateInvoker) Start(calls []ToolCall) {
+	for _, c := range calls {
 		t, ok := r.tools[c.Tool]
 		if !ok {
-			results[i] = ToolResult{Err: restate.TerminalErrorf("unknown tool %q", c.Tool)}
+			r.ready[c.Handle] = readyOp{err: restate.TerminalErrorf("unknown tool %q", c.Tool), name: c.Tool}
 			continue
 		}
 		f, err := r.submit(t, c) // NON-blocking: reserves a journal slot, returns immediately
 		if err != nil {
-			results[i] = ToolResult{Err: err}
+			r.ready[c.Handle] = readyOp{err: err, name: c.Tool}
 			continue
 		}
-		pend = append(pend, pending{idx: i, f: f})
+		r.pending[c.Handle] = pendingOp{fut: f, name: c.Tool}
 	}
+}
 
-	// Every future above is in flight. restate.Wait drives the state machine,
-	// advancing them CONCURRENTLY and yielding as each settles; we discard the
-	// yield order and read each result by index (the identical discipline used for
-	// the sanctioned fan-out/fan-in in examples/parallelizework).
-	if len(pend) > 0 {
-		sels := make([]restate.Future, len(pend))
-		for j, p := range pend {
-			sels[j] = p.f.selectable()
-		}
-		// restate.Wait yields each future as it settles; on a Restate CANCELLATION it
-		// yields a final (nil, TerminalError). That is invocation-fatal, NOT a
-		// per-tool failure: if we fell through and read the futures by index, each
-		// unfinished one would return a 409 and be demoted to a rejected JS promise
-		// that a defensive program could swallow (silently "succeeding" a cancelled
-		// turn). So capture it and abort the whole invocation instead.
-		var fatal restate.TerminalError
-		for _, werr := range restate.Wait(r.rctx, sels...) {
-			if werr != nil {
-				fatal = werr
+// Pending reports how many ops are still in flight (submitted futures + not-yet-
+// delivered submit failures).
+func (r *restateInvoker) Pending() int { return len(r.pending) + len(r.ready) }
+
+// Next drives the in-flight ops until the FIRST settles and returns it. Ops that
+// failed at submit time settle first (immediately available), in ascending handle
+// order; otherwise restate.WaitFirst races the futures and yields the first to
+// complete — in journaled order on replay, so which op "wins" is reproduced. A
+// non-nil error is invocation-fatal (e.g. a Restate cancellation).
+func (r *restateInvoker) Next(_ context.Context) (StepResult, error) {
+	if len(r.ready) > 0 {
+		h := -1
+		for k := range r.ready {
+			if h < 0 || k < h {
+				h = k
 			}
 		}
-		if fatal != nil {
-			panic(fatalError{fatal})
-		}
-		for _, p := range pend {
-			v, err := p.f.resultJSON()
-			results[p.idx] = ToolResult{Value: v, Err: err}
+		op := r.ready[h]
+		delete(r.ready, h)
+		return StepResult{Handle: h, ErrMsg: op.err.Error(), IsErr: true}, nil
+	}
+
+	sels := make([]restate.Future, 0, len(r.pending))
+	handles := make([]int, 0, len(r.pending))
+	for h, op := range r.pending {
+		sels = append(sels, op.fut.selectable())
+		handles = append(handles, h)
+	}
+	fut, cancelled := restate.WaitFirst(r.rctx, sels...)
+	if cancelled != nil {
+		return StepResult{}, cancelled
+	}
+	h := -1
+	for i := range sels {
+		if sels[i] == fut {
+			h = handles[i]
+			break
 		}
 	}
-	return results
+	if h < 0 {
+		return StepResult{}, restate.TerminalErrorf("WaitFirst returned an unknown future")
+	}
+	op := r.pending[h]
+	delete(r.pending, h)
+	v, err := op.fut.resultJSON()
+	if err != nil {
+		return StepResult{Handle: h, ErrMsg: err.Error(), IsErr: true}, nil
+	}
+	if len(v) == 0 {
+		v = json.RawMessage("null")
+	} else if !json.Valid(v) {
+		return StepResult{Handle: h, ErrMsg: fmt.Sprintf("tool %q returned invalid JSON", op.name), IsErr: true}, nil
+	}
+	return StepResult{Handle: h, Value: v}, nil
 }
 
 // submit turns one tool call into an in-flight durable Future WITHOUT blocking. A

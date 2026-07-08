@@ -1,23 +1,21 @@
 // engine.go drives the embedded QuickJS WASM guest (built from guest-rs/) via
-// wazero, using a RE-EXECUTION (replay) model rather than a live, suspended program.
+// wazero, using a LIVE COROUTINE model: the guest runs the program ONCE and the host
+// drives it to completion by settling its promises as durable operations finish.
 //
-// The guest is a stateless one-shot evaluator: `execute(script)` runs an assembled
-// script to synchronous quiescence and returns an output blob — it never calls back
-// into the host and holds nothing between calls. A program is run as a *conversation*:
-//
+//	out = guest.start(script)                    // determinism + bridge + program
 //	loop:
-//	  script  = assemble(journal)                 // determinism + tool/journal prelude + program
-//	  out     = guest.execute(script)             // run to first unresolved tool call
-//	  done    -> return the program's answer
-//	  error   -> return a program error (fed back to the model)
-//	  frontier-> resolve those tool calls durably, append results to the journal, loop
+//	  done  -> return the program's answer
+//	  error -> return a program error (fed back to the model)
+//	  ops   -> inv.Start(new ops)                // submit each as a durable future
+//	           res = inv.Next()                  // race them; FIRST completion wins
+//	           out = guest.resolve/reject(res)   // settle that one promise, get next step
 //
-// Each round re-runs the program from the top; already-resolved tool calls return
-// their journaled results, so it advances to the next unresolved call. This mirrors
-// Restate's own durable replay, one level down — and it means the guest keeps no
-// per-program state, so there are no cross-call globals. Guest instances are still
-// POOLED (acquire/release) purely to avoid re-instantiation churn; reuse is trivially
-// safe because the guest is stateless.
+// Settling promises one-at-a-time in completion order is what makes first-completion
+// (Promise.race / timeouts) work, and it mirrors Restate's own Select: on crash the
+// host re-runs `start` and feeds the journaled completions back in the same order, so
+// the program re-derives identically. State lives in the guest for the duration of one
+// program; the host owns durability. Instances are POOLED and checked out EXCLUSIVELY
+// (one live program per instance at a time); a fresh `start` resets the guest state.
 package agent
 
 import (
@@ -58,31 +56,38 @@ func (r *lcgReader) Read(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Guest output status — must match guest-rs (the "s" field of the output blob).
+// Guest step status — must match guest-rs (the "s" field of the step blob).
 const (
 	outDone  = 0 // program settled: "r" holds its return value
-	outCalls = 1 // program blocked: "frontier" holds the new tool calls to run
-	outError = 2 // program error (throw / deadlock): "error" holds the message
+	outCalls = 1 // program running: "ops" holds the new operations it started this step
+	outError = 2 // program error (throw): "error" holds the message
 )
 
-// guestOutput is the JSON blob execute() returns.
-type guestOutput struct {
-	S        int             `json:"s"`
-	R        json.RawMessage `json:"r"`
-	Frontier []frontierCall  `json:"frontier"`
-	Error    string          `json:"error"`
+// guestStep is the JSON blob each guest export (start/resolve/reject) returns.
+type guestStep struct {
+	S     int             `json:"s"`
+	R     json.RawMessage `json:"r"`
+	Ops   []guestOp       `json:"ops"`
+	Error string          `json:"error"`
 }
 
-type frontierCall struct {
-	Name string          `json:"name"`
-	Arg  json.RawMessage `json:"arg"`
+// guestOp is one operation the program started this step: a stable, deterministic
+// handle plus the tool name and argument. The host settles the promise for `handle`
+// once the corresponding durable future completes.
+type guestOp struct {
+	Handle int             `json:"handle"`
+	Name   string          `json:"name"`
+	Arg    json.RawMessage `json:"arg"`
 }
 
-// maxProgramRounds bounds the re-execution loop (a program making this many
-// sequential tool calls is pathological). Nothing bounds wall-clock time WITHIN a
-// single execute; WithCloseOnContextDone only lets an invocation cancellation
-// interrupt a stuck guest.
-const maxProgramRounds = 4096
+// maxProgramSteps bounds the drive loop. In the live model each step settles ONE
+// operation (one WaitFirst completion), so this caps the TOTAL operations a single
+// program may complete — parallel width and sequential depth both count against it.
+// It is the sole backstop against a runaway tool-calling loop now that there is no
+// per-program timeout, so it is set well above any realistic fan-out. Nothing bounds
+// wall-clock time inside a guest call; WithCloseOnContextDone only lets an invocation
+// cancellation interrupt a stuck guest.
+const maxProgramSteps = 65536
 
 // fatalError signals that execution must ABORT with this error rather than be fed
 // back to the model. The resolve callback panics with it on invocation-fatal
@@ -219,16 +224,12 @@ func (e *Engine) release(ctx context.Context, g *guest, healthy bool) {
 	}
 }
 
-// Run drives one program via the re-execution loop. `assemble(journal)` builds the
-// script for a round (injecting the journal of results so far); `resolve` runs a
-// frontier of tool calls durably and returns their results (to append to the
-// journal). It returns the program's answer (JSON), or a program error to feed back
-// to the model. A guest trap or Restate cancellation is recovered here.
-func (e *Engine) Run(
-	ctx context.Context,
-	assemble func(journal []ToolResult) string,
-	resolve func(ctx context.Context, calls []ToolCall) []ToolResult,
-) (result string, err error) {
+// RunLive drives one program as a live coroutine: `start` the assembled script, then
+// repeatedly submit the ops it emits (inv.Start), race them for the first completion
+// (inv.Next), and settle that promise in the guest (resolve/reject) to get the next
+// step. It returns the program's answer (JSON), or a program error to feed back to
+// the model. A guest trap or Restate cancellation is recovered here.
+func (e *Engine) RunLive(ctx context.Context, script string, inv Invoker) (result string, err error) {
 	if !e.enter() {
 		return "", errEngineClosed
 	}
@@ -254,40 +255,63 @@ func (e *Engine) Run(
 				}
 			}
 		}
-		// Reuse the instance unless a trap/timeout fired (recovered above, so healthy
-		// is still false). The guest is stateless, so a mere program error is fine.
+		// Reuse the instance unless a trap fired (recovered above, so healthy is still
+		// false). A fresh `start` resets the guest state, so a mere program error is fine.
 		e.release(ctx, g, healthy && ctx.Err() == nil)
 	}()
 
-	var journal []ToolResult
-	for range maxProgramRounds {
-		out, execErr := g.execute(ctx, []byte(assemble(journal)))
-		if execErr != nil {
-			return "", execErr
-		}
-		var o guestOutput
-		if e2 := json.Unmarshal(out, &o); e2 != nil {
+	out, err := g.start(ctx, []byte(script))
+	if err != nil {
+		return "", err
+	}
+	for range maxProgramSteps {
+		var step guestStep
+		if e2 := json.Unmarshal(out, &step); e2 != nil {
 			healthy = true
 			return "", fmt.Errorf("guest returned invalid output: %v", e2)
 		}
-		switch o.S {
+		switch step.S {
 		case outDone:
 			healthy = true
-			return string(o.R), nil
+			return string(step.R), nil
 		case outError:
 			healthy = true
-			return "", fmt.Errorf("js error: %s", o.Error)
+			return "", fmt.Errorf("js error: %s", step.Error)
 		case outCalls:
-			frontier := make([]ToolCall, len(o.Frontier))
-			for i, c := range o.Frontier {
-				frontier[i] = ToolCall{Tool: c.Name, Arg: c.Arg}
+			if len(step.Ops) > 0 {
+				calls := make([]ToolCall, len(step.Ops))
+				for i, o := range step.Ops {
+					calls[i] = ToolCall{Handle: o.Handle, Tool: o.Name, Arg: o.Arg}
+				}
+				inv.Start(calls)
 			}
-			journal = append(journal, resolve(ctx, frontier)...)
+			if inv.Pending() == 0 {
+				// No new ops and nothing in flight, yet the program hasn't settled — it
+				// awaited something that can never complete (a JS-level deadlock).
+				healthy = true
+				return "", fmt.Errorf("program made no progress (awaiting with no pending operations)")
+			}
+			res, fatal := inv.Next(ctx)
+			if fatal != nil {
+				panic(fatalError{fatal})
+			}
+			if res.IsErr {
+				out, err = g.reject(ctx, res.Handle, []byte(res.ErrMsg))
+			} else {
+				v := res.Value
+				if len(v) == 0 {
+					v = []byte("null")
+				}
+				out, err = g.resolve(ctx, res.Handle, v)
+			}
+			if err != nil {
+				return "", err
+			}
 		default:
 			healthy = true
-			return "", fmt.Errorf("guest returned unknown status %d", o.S)
+			return "", fmt.Errorf("guest returned unknown status %d", step.S)
 		}
 	}
 	healthy = true
-	return "", fmt.Errorf("program exceeded %d execution rounds", maxProgramRounds)
+	return "", fmt.Errorf("program exceeded %d steps", maxProgramSteps)
 }

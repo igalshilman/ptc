@@ -8,6 +8,7 @@ import (
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
+	restate "github.com/restatedev/sdk-go"
 	"github.com/restatedev/sdk-go/server"
 )
 
@@ -26,6 +27,9 @@ type RunConfig struct {
 	Tools func(client openai.Client, model string) []Tool
 	// MaxRounds is the per-message loop budget (0 → default 10).
 	MaxRounds int
+	// Extra are additional Restate services to bind alongside the agent — e.g. a
+	// service the `rpc` tool can call (see examples/primitives). Optional.
+	Extra []restate.ServiceDefinition
 }
 
 // Main is the one-call entrypoint for an example binary: it resolves the OpenAI client
@@ -53,7 +57,7 @@ func Main(cfg RunConfig) {
 		log.Fatalf("agent.Main: build service: %v", err)
 	}
 	defer svc.Close(ctx)
-	Serve(ctx, svc)
+	Serve(ctx, svc, cfg.Extra...)
 }
 
 // ClientFromEnv builds an OpenAI(-compatible) client and resolves the model id from the
@@ -72,13 +76,17 @@ func ClientFromEnv() (openai.Client, string, error) {
 	return openai.NewClient(opts...), envOr("AGENT_MODEL", "gpt-5"), nil
 }
 
-// Serve binds the Service's Restate service definitions and serves them on AGENT_ADDR
-// (default :9080), blocking until the server stops (a fatal error exits the process).
-func Serve(ctx context.Context, svc *Service) {
+// Serve binds the Service's Restate service definitions (plus any extra ones) and
+// serves them on AGENT_ADDR (default :9080), blocking until the server stops (a fatal
+// error exits the process).
+func Serve(ctx context.Context, svc *Service, extra ...restate.ServiceDefinition) {
 	addr := envOr("AGENT_ADDR", ":9080")
 	log.Printf("durable CodeAct agent listening on %s", addr)
 	srv := server.NewRestate()
 	for _, d := range svc.Definitions() {
+		srv = srv.Bind(d)
+	}
+	for _, d := range extra {
 		srv = srv.Bind(d)
 	}
 	if err := srv.Start(ctx, addr); err != nil {

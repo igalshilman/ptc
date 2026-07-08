@@ -16,39 +16,38 @@ type ToolSpec struct {
 	Result      json.RawMessage
 }
 
-// Invoker is the durable backend behind the JS tools. When a program running in
-// the sandbox calls a tool (a plain async JS function), the call arrives here as
-// (tool, arg) and the returned JSON becomes the JS promise's resolved value; a
-// non-nil error becomes a rejected promise. Implementations:
+// Invoker is the durable backend behind the JS tools. As the program runs it starts
+// operations (tool calls) the host completes durably; each op carries a stable
+// handle. Implementations:
 //
 //   - test doubles (agent_test.go): in-memory Go funcs, for the offline tests.
-//   - restateInvoker (service.go): submits each call as a durable Future — leaf
-//     tools in-process, seq tools as their own sub-invocation — and drives the
-//     whole batch with one restate.Wait. Journaled and replay-safe; none of that
-//     is visible to the JS program.
+//   - restateInvoker (service.go): submits each op as a durable Future — leaf tools
+//     in-process, seq tools as their own sub-invocation — and races them with
+//     restate.WaitFirst. Journaled and replay-safe; none of that is visible to the JS.
 type Invoker interface {
 	// Tools returns the registered tool specs, in a stable order. Names drive the
-	// JS prelude; the full specs (incl. JSON Schema) are surfaced to the model.
+	// JS bridge; the full specs (incl. JSON Schema) are surfaced to the model.
 	Tools() []ToolSpec
-	// InvokeBatch runs one re-execution round's frontier of tool calls (always a
-	// batch — size 1 for a sequential await, more for a Promise.all) and returns
-	// their results in order. A result's non-nil Err becomes a rejected JS promise
-	// on the next round. Implementations run the batch durably and, where possible,
-	// in parallel (see restateInvoker).
-	InvokeBatch(ctx context.Context, calls []ToolCall) []ToolResult
+	// Start submits new ops as in-flight durable operations, keyed by ToolCall.Handle.
+	// Non-blocking.
+	Start(calls []ToolCall)
+	// Next drives the in-flight ops until the FIRST one settles and returns it. A
+	// non-nil error is invocation-FATAL (e.g. a Restate cancellation), not a per-op
+	// failure. Must not be called when Pending() == 0.
+	Next(ctx context.Context) (StepResult, error)
+	// Pending reports how many ops are still in flight (for deadlock detection).
+	Pending() int
 }
 
-// Sandbox runs a single JS program with the registered tools exposed as plain
-// async JS functions. The agent LOOP lives in Go (see loop.go): each round the
-// model generates a program and the loop runs it here. A fresh QuickJS instance
-// is used per program, so programs share no JS state across rounds — state flows
-// back to the model as observations.
+// Sandbox runs a single JS program with the registered tools exposed as plain async
+// JS functions. The agent LOOP lives in Go (see loop.go): each round the model
+// generates a program and the loop runs it here as a live coroutine (see engine.go).
 //
-// Determinism: because a program is re-run verbatim on crash/replay, its
-// randomness and clock must be replay-stable. seed and nowMillis (set via
-// SetDeterminism from Restate's deterministic sources in production) freeze
-// Math.random/Date.now/new Date(); callSeq gives each program in a run a distinct
-// but replay-stable sub-seed.
+// Determinism: on crash/replay the guest re-runs the program from the top and the
+// host feeds the journaled completions back in the same order, so randomness and the
+// clock must be replay-stable. seed and nowMillis (set via SetDeterminism from
+// Restate's deterministic sources in production) freeze Math.random/Date.now/new
+// Date(); callSeq gives each program in a run a distinct but replay-stable sub-seed.
 type Sandbox struct {
 	engine    *Engine
 	inv       Invoker
@@ -75,90 +74,24 @@ func (s *Sandbox) Tools() []ToolSpec { return s.inv.Tools() }
 // `return` value encoded as JSON. A thrown JS error or a rejected tool promise
 // surfaces as a non-nil error (which the loop feeds back to the model).
 //
-// Execution is by RE-EXECUTION (see engine.Run): the program is re-run from the top
-// each round, with a journal of the tool results so far injected as JS. A journaled
-// tool call returns its recorded result immediately; a new call is collected in the
-// frontier and the program blocks, so the round returns the frontier for the host to
-// run durably. This keeps the guest stateless — no live, suspended program.
+// The program runs as a LIVE coroutine (see engine.RunLive): it is started once and
+// driven by the host, which settles each tool-call promise as its durable operation
+// completes. Only the tool operations are durable; running the JS is pure.
 func (s *Sandbox) RunProgram(ctx context.Context, program string) (string, error) {
 	seq := s.callSeq
 	s.callSeq++
-	// ONE seed per program, reused across every re-execution of it, so the program's
-	// tool-call sequence is identical each round and journal-by-index matching holds.
+	// ONE seed per program (reused if it re-runs on replay), so its clock, randomness,
+	// and thus its operation sequence are identical across replays.
 	progSeed := int64(uint64(s.seed) ^ (uint64(seq)+1)*0x9e3779b97f4a7c15)
 
-	det := s.determinismPrelude(progSeed)
-	bridge := s.toolBridge()
-	wrapper := wrapperPreJS + program + wrapperPostJS
-
-	// assemble builds one round's script: determinism + this round's journal + the
-	// tool bridge (names + __hostCall) + the wrapped program.
-	assemble := func(journal []ToolResult) string {
-		return det + "globalThis.__journal = " + journalJSON(journal) + ";\n" + bridge + wrapper
-	}
-	// resolve runs a frontier of tool calls durably (batched/parallel if supported),
-	// then validates the JSON contract — naming the tool on failure so a misbehaving
-	// tool yields a clear error rather than an opaque JS parse rejection on replay.
-	resolve := func(ctx context.Context, calls []ToolCall) []ToolResult {
-		results := s.inv.InvokeBatch(ctx, calls)
-		for i := range results {
-			if results[i].Err != nil {
-				continue
-			}
-			if len(results[i].Value) == 0 {
-				results[i].Value = json.RawMessage("null")
-			} else if !json.Valid(results[i].Value) {
-				name := "?"
-				if i < len(calls) {
-					name = calls[i].Tool
-				}
-				results[i] = ToolResult{Err: fmt.Errorf("tool %q returned invalid JSON", name)}
-			}
-		}
-		return results
-	}
-	return s.engine.Run(ctx, assemble, resolve)
-}
-
-// journalJSON serializes the tool results gathered so far into the JS array the
-// guest replays: each entry is {"v":<result>} on success or {"err":"<msg>"} on
-// error, matched to tool calls by ORDER. A tool result that isn't valid JSON becomes
-// a clear error entry (rather than an opaque JS parse failure at replay).
-func journalJSON(journal []ToolResult) string {
-	type entry struct {
-		V   json.RawMessage `json:"v,omitempty"`
-		Err *string         `json:"err,omitempty"`
-	}
-	entries := make([]entry, len(journal))
-	for i, r := range journal {
-		switch {
-		case r.Err != nil:
-			m := r.Err.Error()
-			entries[i] = entry{Err: &m}
-		default:
-			v := r.Value
-			if len(v) == 0 {
-				v = json.RawMessage("null")
-			}
-			if !json.Valid(v) {
-				m := fmt.Sprintf("tool returned invalid JSON: %s", string(v))
-				entries[i] = entry{Err: &m}
-			} else {
-				entries[i] = entry{V: v}
-			}
-		}
-	}
-	b, err := json.Marshal(entries)
-	if err != nil {
-		return "[]"
-	}
-	return string(b)
+	script := s.determinismPrelude(progSeed) + s.toolBridge() + wrapperPreJS + program + wrapperPostJS
+	return s.engine.RunLive(ctx, script, s.inv)
 }
 
 // The injected JS lives in these raw-string constants — real JS, not escaped Go
 // fragments — so it reads and reviews as JS and is decoupled from the assembly
-// logic. Values (seed, clock, tool names, journal, program) are substituted at
-// assembly time (see RunProgram): none of the templates contain a literal '%'.
+// logic. Values (seed, clock, tool names, program) are substituted at assembly time
+// (see RunProgram): none of the templates contain a literal '%'.
 
 // detPreludeJS freezes clock/randomness at the JS level (so it survives instance
 // reuse — the WASI clock/rand are bound at instantiation). %d/%d = seed, now.
@@ -190,24 +123,29 @@ const detPreludeJS = `;(function () {
 })();
 `
 
-// bridgeJS is the __hostCall bridge: it REPLAYS globalThis.__journal by call order
-// (a known call resolves with its recorded result / rejects for a recorded error; a
-// new call is pushed to globalThis.__frontier and returns a never-resolving promise
-// so the program blocks), and defines each name in globalThis.__toolNames as a plain
-// async function over it. Both globals are injected just before this runs.
+// bridgeJS is the live host-call bridge. Each tool call gets a deterministic integer
+// handle, stashes its promise's {res, rej} in globalThis.__pending, records
+// {handle,name,arg} in globalThis.__outbox (the host drains it each step), and returns
+// the promise. The host settles a promise later via __resolveJSON(handle, jsonText) or
+// __reject(handle, msg). Each name in globalThis.__toolNames becomes a plain async
+// function over __hostCall; __toolNames is injected just before this runs.
 const bridgeJS = `;(function () {
-  var __journal = globalThis.__journal || [];
-  var __i = 0;
-  var __frontier = [];
-  globalThis.__frontier = __frontier;
+  globalThis.__pending = globalThis.__pending || {};
+  globalThis.__outbox = globalThis.__outbox || [];
+  if (globalThis.__nextHandle === undefined) globalThis.__nextHandle = 0;
   globalThis.__hostCall = function (name, arg) {
-    var idx = __i++;
-    if (idx < __journal.length) {
-      var e = __journal[idx];
-      return ('err' in e) ? Promise.reject(new Error(e.err)) : Promise.resolve(e.v);
-    }
-    __frontier.push({ name: name, arg: arg });
-    return new Promise(function () {}); // never resolves this run
+    var handle = globalThis.__nextHandle++;
+    var p = new Promise(function (res, rej) { globalThis.__pending[handle] = { res: res, rej: rej }; });
+    globalThis.__outbox.push({ handle: handle, name: name, arg: arg === undefined ? null : arg });
+    return p;
+  };
+  globalThis.__resolveJSON = function (handle, jsonText) {
+    var e = globalThis.__pending[handle];
+    if (e) { delete globalThis.__pending[handle]; e.res(JSON.parse(jsonText)); }
+  };
+  globalThis.__reject = function (handle, msg) {
+    var e = globalThis.__pending[handle];
+    if (e) { delete globalThis.__pending[handle]; e.rej(new Error(msg)); }
   };
   var tools = {};
   (globalThis.__toolNames || []).forEach(function (n) {
@@ -232,9 +170,8 @@ func (s *Sandbox) determinismPrelude(seed int64) string {
 	return fmt.Sprintf(detPreludeJS, uint32(seed), s.nowMillis)
 }
 
-// toolBridge injects this run's tool names, then the (static) __hostCall bridge
-// (bridgeJS). Requires globalThis.__journal to be set before it runs — RunProgram
-// injects the journal just above it.
+// toolBridge injects this run's tool names, then the (static) live host-call bridge
+// (bridgeJS).
 func (s *Sandbox) toolBridge() string {
 	specs := s.inv.Tools()
 	names := make([]string, len(specs))
@@ -245,14 +182,20 @@ func (s *Sandbox) toolBridge() string {
 	return "globalThis.__toolNames = " + string(namesJSON) + ";\n" + bridgeJS
 }
 
-// ToolCall / ToolResult are the (tool, arg) form the Invoker sees, one per
-// pending JS promise in a batch.
+// ToolCall is one operation the program started: a stable, deterministic handle plus
+// the tool name and its JSON argument.
 type ToolCall struct {
-	Tool string
-	Arg  json.RawMessage
+	Handle int
+	Tool   string
+	Arg    json.RawMessage
 }
 
-type ToolResult struct {
-	Value json.RawMessage
-	Err   error
+// StepResult is the settlement of one operation that the Invoker's Next returns: the
+// handle it belongs to and either a JSON value (Value) or an error message (ErrMsg,
+// when IsErr).
+type StepResult struct {
+	Handle int
+	Value  json.RawMessage // valid JSON on success (empty → treated as null)
+	ErrMsg string          // set iff IsErr
+	IsErr  bool
 }

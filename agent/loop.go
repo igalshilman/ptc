@@ -73,8 +73,8 @@ func BuildSystemPrompt(specs []ToolSpec) string {
 	b.WriteString("A single program may chain several tool calls. Example code:\n")
 	b.WriteString("    const r = await someTool({key: \"value\"});\n")
 	b.WriteString("    return {done: true, answer: r.value};\n")
-	b.WriteString("Always prefer to run the tools in parallel using Promise.all/allSettled/race/any structure your programs for concurrency\n")
-	b.WriteString("Tool results are captured durably, so retries never repeat a completed tool call.\n\n")
+	b.WriteString("When several tool calls are INDEPENDENT, issue them together with Promise.all (or Promise.allSettled) so they run as one batch.\n")
+	b.WriteString("Tool results are captured durably, so no need for retries.\n\n")
 	if len(specs) == 0 {
 		b.WriteString("No tools are available.")
 		return b.String()
