@@ -17,6 +17,11 @@ type Config struct {
 	Model     string        // model id (default "gpt-4o-mini")
 	Tools     []Tool        // developer tools exposed to the agent
 	MaxRounds int           // loop budget per message (default 10)
+	// Discover, if set, makes each Ask discover handler-tools from the Restate Admin
+	// API and merge them with Tools. Discovery is journaled, so the tool set is
+	// identical across replays. Use this for a standalone deployment whose target
+	// services register alongside the agent (and so aren't visible until after startup).
+	Discover *DiscoverConfig
 }
 
 // Service is a durable CodeAct agent exposed as a Restate Virtual Object: each
@@ -30,6 +35,7 @@ type Service struct {
 	tools      []Tool
 	toolByName map[string]Tool // for the AgentTools/Exec dispatch (seq tools)
 	maxRounds  int
+	discover   *DiscoverConfig // optional Admin-API handler discovery (per Ask)
 }
 
 // Names of the companion service that runs seq tools as their own sub-invocations.
@@ -63,6 +69,7 @@ func NewService(ctx context.Context, cfg Config) (*Service, error) {
 		tools:      cfg.Tools,
 		toolByName: byName,
 		maxRounds:  rounds,
+		discover:   cfg.Discover,
 	}, nil
 }
 
@@ -132,13 +139,31 @@ func (s *Service) Ask(ctx restate.ObjectContext, in AskInput) (AskOutput, error)
 	}
 	convo := &Conversation{Turns: append(history, Turn{Role: RoleUser, Content: in.Message})}
 
+	// Resolve this turn's tool set: the static tools plus, if configured, handlers
+	// discovered from the Admin API. Discovery is a JOURNALED step, so the tool set —
+	// and thus the system prompt and the dispatch table — is identical across replays.
+	tools := s.tools
+	if s.discover != nil {
+		discovered, derr := restate.Run(ctx, func(rc restate.RunContext) ([]handlerDescriptor, error) {
+			return fetchHandlers(rc, *s.discover)
+		}, restate.WithName("discover"))
+		if derr != nil {
+			return AskOutput{}, derr
+		}
+		tools = make([]Tool, 0, len(s.tools)+len(discovered))
+		tools = append(tools, s.tools...)
+		for _, d := range discovered {
+			tools = append(tools, toolFromDescriptor(d))
+		}
+	}
+
 	inv := &restateInvoker{
 		rctx:    ctx,
 		tools:   map[string]Tool{},
 		pending: map[int]pendingOp{},
 		ready:   map[int]readyOp{},
 	}
-	for _, t := range s.tools {
+	for _, t := range tools {
 		inv.tools[t.Name] = t
 		inv.order = append(inv.order, t.Name)
 	}
@@ -154,7 +179,7 @@ func (s *Service) Ask(ctx restate.ObjectContext, in AskInput) (AskOutput, error)
 	}
 	sb.SetDeterminism(restate.Rand(ctx).Int64(), now) // math/rand/v2: Int64, not Int63
 
-	model := &openAIModel{rctx: ctx, client: s.client, model: s.model, system: BuildSystemPrompt(toolSpecs(s.tools))}
+	model := &openAIModel{rctx: ctx, client: s.client, model: s.model, system: BuildSystemPrompt(toolSpecs(tools))}
 
 	answer, agentErr := RunAgent(ctx, sb, model, convo, s.maxRounds, func(f string, a ...any) {
 		ctx.Log().Info(fmt.Sprintf(f, a...))

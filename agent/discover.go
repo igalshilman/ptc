@@ -12,54 +12,85 @@ import (
 	restate "github.com/restatedev/sdk-go"
 )
 
-// DiscoverTools queries a Restate Admin API and turns EVERY registered handler into a
-// leaf tool the agent can call — so the model can orchestrate an existing deployment's
-// durable handlers (in parallel, durably) via generated code, with no manual wiring.
-//
-// Each handler becomes a leaf tool backed by a durable service call (agent.Call for a
-// plain Service, agent.CallObject for a Virtual Object / Workflow, whose arg is
-// {key, input}). The handler's input/output JSON schemas from discovery are surfaced
-// to the model, so it calls handlers with the right shapes.
-//
-// It runs at STARTUP, so the target services must already be registered in the runtime
-// (deploy them before starting the agent). The agent's own services (and any in Deny)
-// are skipped to avoid same-session reentrancy/deadlock.
-func DiscoverTools(ctx context.Context, adminURL string, opts DiscoverOptions) ([]Tool, error) {
-	svcs, err := fetchServices(ctx, adminURL)
+// DiscoverConfig configures Admin-API handler discovery: turn EVERY registered
+// handler into a leaf tool the agent can call, so the model can orchestrate an
+// existing deployment's durable handlers (in parallel, durably) via generated code.
+type DiscoverConfig struct {
+	AdminURL string   // Restate Admin API base URL (default http://localhost:9070)
+	Allow    []string // if non-empty, only these service names become tools
+	Deny     []string // service names to skip (Agent/AgentTools are always skipped)
+}
+
+const (
+	agentObjectService = "Agent"
+	defaultAdminURL    = "http://localhost:9070"
+)
+
+// DiscoverTools fetches the handlers now and builds their tools in one call — for
+// STARTUP discovery of services that are ALREADY registered. For a standalone
+// deployment (where the target services register alongside the agent, so they aren't
+// visible until after startup), use Config.Discover, which discovers lazily per Ask
+// and journals the result for replay-safety.
+func DiscoverTools(ctx context.Context, cfg DiscoverConfig) ([]Tool, error) {
+	ds, err := fetchHandlers(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	tools := make([]Tool, len(ds))
+	for i, d := range ds {
+		tools[i] = toolFromDescriptor(d)
+	}
+	return tools, nil
+}
+
+// handlerDescriptor is the JSON-serializable discovery result for one handler. It is
+// what Ask JOURNALS (via restate.Run), so the tool set is rebuilt IDENTICALLY on
+// replay — discovery is a non-deterministic external call that shapes the prompt and
+// the callable tools, so it must be captured once and replayed.
+type handlerDescriptor struct {
+	Service string          `json:"service"`
+	Handler string          `json:"handler"`
+	Keyed   bool            `json:"keyed"`
+	Doc     string          `json:"doc,omitempty"`
+	Params  json.RawMessage `json:"params,omitempty"`
+	Result  json.RawMessage `json:"result,omitempty"`
+}
+
+// fetchHandlers queries the Admin API and returns a descriptor per handler (after
+// filtering). This is the non-deterministic part; keep it pure of Tool construction
+// so callers can journal the descriptors.
+func fetchHandlers(ctx context.Context, cfg DiscoverConfig) ([]handlerDescriptor, error) {
+	svcs, err := fetchServices(ctx, cfg.AdminURL)
 	if err != nil {
 		return nil, err
 	}
 	deny := map[string]bool{agentObjectService: true, agentToolsService: true}
-	for _, d := range opts.Deny {
+	for _, d := range cfg.Deny {
 		deny[d] = true
 	}
 	allow := map[string]bool{}
-	for _, a := range opts.Allow {
+	for _, a := range cfg.Allow {
 		allow[a] = true
 	}
-
-	var tools []Tool
+	var out []handlerDescriptor
 	for _, s := range svcs {
 		if deny[s.Name] || (len(allow) > 0 && !allow[s.Name]) {
 			continue
 		}
 		keyed := s.keyed()
 		for _, h := range s.Handlers {
-			tools = append(tools, discoveredTool(s.Name, h, keyed))
+			out = append(out, handlerDescriptor{
+				Service: s.Name,
+				Handler: h.Name,
+				Keyed:   keyed,
+				Doc:     h.Documentation,
+				Params:  h.InputJSONSchema,
+				Result:  h.OutputJSONSchema,
+			})
 		}
 	}
-	return tools, nil
+	return out, nil
 }
-
-// DiscoverOptions filters which services become tools. Allow (if non-empty) is a
-// whitelist of service names; Deny is a blacklist. The agent's own services are always
-// skipped.
-type DiscoverOptions struct {
-	Allow []string
-	Deny  []string
-}
-
-const agentObjectService = "Agent"
 
 // --- Admin API client --------------------------------------------------------
 
@@ -83,8 +114,10 @@ type adminHandler struct {
 	OutputJSONSchema json.RawMessage `json:"output_json_schema"`
 }
 
-// fetchServices calls GET {adminURL}/services and returns the registered services.
 func fetchServices(ctx context.Context, adminURL string) ([]adminService, error) {
+	if strings.TrimSpace(adminURL) == "" {
+		adminURL = defaultAdminURL
+	}
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	url := strings.TrimRight(adminURL, "/") + "/services"
@@ -118,22 +151,24 @@ func fetchServices(ctx context.Context, adminURL string) ([]adminService, error)
 	return bare, nil
 }
 
-// --- Tool construction -------------------------------------------------------
+// --- Tool construction (pure) ------------------------------------------------
 
-// discoveredTool builds a leaf tool that durably calls one handler. A plain Service
-// handler takes the handler's input directly; a keyed (Virtual Object / Workflow)
-// handler takes {key, input}. In-package so it can set the unexported submit.
-func discoveredTool(service string, h adminHandler, keyed bool) Tool {
-	name := sanitizeName(service + "_" + h.Name)
-	params := h.InputJSONSchema
-	if keyed {
-		params = keyedParams(h.InputJSONSchema)
+// toolFromDescriptor builds a leaf tool that durably calls one handler. A plain
+// Service handler takes the handler's input directly; a keyed (Virtual Object /
+// Workflow) handler takes {key, input}. In-package so it can set the unexported
+// submit; deterministic so it rebuilds identically on replay.
+func toolFromDescriptor(d handlerDescriptor) Tool {
+	name := sanitizeName(d.Service + "_" + d.Handler)
+	params := d.Params
+	if d.Keyed {
+		params = keyedParams(d.Params)
 	}
+	service, handler, keyed := d.Service, d.Handler, d.Keyed
 	t := Tool{
 		Name:        name,
-		Description: handlerDescription(service, h, keyed),
+		Description: descriptorDescription(d),
 		Params:      params,
-		Result:      h.OutputJSONSchema,
+		Result:      d.Result,
 	}
 	if keyed {
 		t.submit = func(ctx restate.Context, raw json.RawMessage) (anyFuture, error) {
@@ -147,12 +182,11 @@ func discoveredTool(service string, h adminHandler, keyed bool) Tool {
 			if strings.TrimSpace(a.Key) == "" {
 				return nil, restate.TerminalErrorf("%q is a keyed handler; provide a non-empty \"key\"", name)
 			}
-			return CallObject[json.RawMessage](ctx, service, a.Key, h.Name, a.Input), nil
+			return CallObject[json.RawMessage](ctx, service, a.Key, handler, a.Input), nil
 		}
 	} else {
-		hName := h.Name
 		t.submit = func(ctx restate.Context, raw json.RawMessage) (anyFuture, error) {
-			return Call[json.RawMessage](ctx, service, hName, raw), nil
+			return Call[json.RawMessage](ctx, service, handler, raw), nil
 		}
 	}
 	return t
@@ -169,14 +203,14 @@ func keyedParams(input json.RawMessage) json.RawMessage {
 		`"input":` + in + `},"required":["key"]}`)
 }
 
-func handlerDescription(service string, h adminHandler, keyed bool) string {
+func descriptorDescription(d handlerDescriptor) string {
 	var b strings.Builder
-	if strings.TrimSpace(h.Documentation) != "" {
-		b.WriteString(strings.TrimSpace(h.Documentation))
+	if strings.TrimSpace(d.Doc) != "" {
+		b.WriteString(strings.TrimSpace(d.Doc))
 		b.WriteString(" ")
 	}
-	fmt.Fprintf(&b, "Durably call the %s/%s handler.", service, h.Name)
-	if keyed {
+	fmt.Fprintf(&b, "Durably call the %s/%s handler.", d.Service, d.Handler)
+	if d.Keyed {
 		b.WriteString(` Keyed: pass {"key": <string>, "input": <handler input>}.`)
 	}
 	return b.String()

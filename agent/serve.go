@@ -23,8 +23,13 @@ import (
 type RunConfig struct {
 	// Tools builds the example's tool set. It receives the OpenAI client and model id
 	// resolved from the environment, so a tool may CAPTURE them — e.g. a tool that makes
-	// its own durable model call (see examples/research's research_topic). Required.
+	// its own durable model call (see examples/research's research_topic). Required
+	// unless Discover is set.
 	Tools func(client openai.Client, model string) []Tool
+	// Discover, if set, makes each Ask discover handler-tools from the Restate Admin
+	// API (journaled) and merge them with Tools (see examples/orchestrator). Either
+	// Tools or Discover is required.
+	Discover *DiscoverConfig
 	// MaxRounds is the per-message loop budget (0 → default 10).
 	MaxRounds int
 	// Extra are additional Restate services to bind alongside the agent — e.g. a
@@ -39,18 +44,23 @@ type RunConfig struct {
 // process — it is meant for a `package main`, not for embedding (use NewService/Serve
 // directly for that).
 func Main(cfg RunConfig) {
-	if cfg.Tools == nil {
-		log.Fatal("agent.Main: RunConfig.Tools is required")
+	if cfg.Tools == nil && cfg.Discover == nil {
+		log.Fatal("agent.Main: RunConfig needs Tools or Discover")
 	}
 	ctx := context.Background()
 	client, model, err := ClientFromEnv()
 	if err != nil {
 		log.Fatalf("agent.Main: %v", err)
 	}
+	var tools []Tool
+	if cfg.Tools != nil {
+		tools = cfg.Tools(client, model)
+	}
 	svc, err := NewService(ctx, Config{
 		Client:    client,
 		Model:     model,
-		Tools:     cfg.Tools(client, model),
+		Tools:     tools,
+		Discover:  cfg.Discover,
 		MaxRounds: cfg.MaxRounds,
 	})
 	if err != nil {
