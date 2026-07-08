@@ -5,8 +5,8 @@
 //     becomes a tool, discovered from the Admin API. The model orchestrates your
 //     existing durable services (in parallel, durably) via generated code.
 //
-//   - The RESTATE PRIMITIVES as static tools (sleep, rpc, awakeable, resolve, reject),
-//     so the model can also compose raw durable building blocks.
+//   - The RESTATE PRIMITIVES as static tools (sleep, awakeable, resolve, reject), so
+//     the model can also compose raw durable building blocks.
 //
 //     OPENAI_API_KEY=sk-...  go run ./examples/orchestrator   # serves on :9080
 //
@@ -39,7 +39,6 @@ func main() {
 		Tools: func(_ openai.Client, _ string) []agent.Tool {
 			return []agent.Tool{
 				sleepTool(),
-				rpcTool(),
 				awakeableTool(),
 				resolveTool(),
 				rejectTool(),

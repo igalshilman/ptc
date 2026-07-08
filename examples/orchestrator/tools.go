@@ -14,7 +14,7 @@ import (
 // agent auto-discovers from the Admin API (see main.go / services.go). Together the
 // model can both call your annotated durable handlers AND compose raw primitives:
 //
-//   - sleep, rpc            → LEAF tools: one non-blocking submission returning a
+//   - sleep                 → a LEAF tool: one non-blocking submission returning a
 //                             durable Future the batch awaits.
 //   - awakeable             → a LEAF tool that CREATES the awaitable and BLOCKS on it in
 //                             one call (returning the resolved value). Not split into
@@ -42,29 +42,6 @@ func sleepTool() agent.Tool {
 		func(ctx restate.Context, a sleepArgs) (agent.Future[sleepResult], error) {
 			d := time.Duration(a.Seconds * float64(time.Second))
 			return agent.Timer(ctx, d, sleepResult{SleptSeconds: a.Seconds}, restate.WithName("sleep")), nil
-		})
-}
-
-// ---- rpc (leaf: durable service call) ---------------------------------------
-
-type rpcArgs struct {
-	Service string          `json:"service" jsonschema:"description=the Restate service name to call, e.g. \"Echo\""`
-	Handler string          `json:"handler" jsonschema:"description=the handler/method name on that service, e.g. \"echo\""`
-	Arg     json.RawMessage `json:"arg,omitempty" jsonschema:"description=the JSON argument to pass to the handler"`
-}
-
-// rpcTool is a generic escape hatch: call ANY handler by name (including ones not
-// annotated for discovery). The auto-discovered tools are the ergonomic, schema-typed
-// alternative for annotated handlers.
-func rpcTool() agent.Tool {
-	return agent.NewTool("rpc",
-		`durably call any handler by name: {service, handler, arg}. Prefer the auto-discovered per-handler tools when one exists`,
-		func(ctx restate.Context, a rpcArgs) (agent.Future[json.RawMessage], error) {
-			if a.Service == "" || a.Handler == "" {
-				return agent.Future[json.RawMessage]{}, restate.TerminalErrorf("rpc needs a service and handler")
-			}
-			// Pass the raw JSON arg straight through; the response comes back as raw JSON.
-			return agent.Call[json.RawMessage](ctx, a.Service, a.Handler, a.Arg), nil
 		})
 }
 
