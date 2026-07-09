@@ -30,20 +30,17 @@ type Config struct {
 // QuickJS engine and the tool set are fixed at construction and shared across
 // sessions/invocations.
 type Service struct {
-	engine     *Engine
-	client     openai.Client
-	model      string
-	tools      []Tool
-	toolByName map[string]Tool // for the AgentTools/Exec dispatch (seq tools)
-	maxRounds  int
-	discover   *DiscoverConfig // optional Admin-API handler discovery (per Ask)
+	engine    *Engine
+	client    openai.Client
+	model     string
+	tools     []Tool
+	maxRounds int
+	discover  *DiscoverConfig // optional Admin-API handler discovery (per Ask)
 }
 
-// Names of the companion service that runs seq tools as their own sub-invocations.
-const (
-	agentToolsService = "AgentTools"
-	execMethod        = "Exec"
-)
+// agentSignalsService is the framework's keyless companion service; its resolve/reject
+// handlers complete named signals and are annotated for discovery.
+const agentSignalsService = "AgentSignals"
 
 // NewService builds the QuickJS engine and assembles the agent from cfg.
 func NewService(ctx context.Context, cfg Config) (*Service, error) {
@@ -59,18 +56,13 @@ func NewService(ctx context.Context, cfg Config) (*Service, error) {
 	if rounds == 0 {
 		rounds = 10
 	}
-	byName := make(map[string]Tool, len(cfg.Tools))
-	for _, t := range cfg.Tools {
-		byName[t.Name] = t
-	}
 	return &Service{
-		engine:     eng,
-		client:     cfg.Client,
-		model:      model,
-		tools:      cfg.Tools,
-		toolByName: byName,
-		maxRounds:  rounds,
-		discover:   cfg.Discover,
+		engine:    eng,
+		client:    cfg.Client,
+		model:     model,
+		tools:     cfg.Tools,
+		maxRounds: rounds,
+		discover:  cfg.Discover,
 	}, nil
 }
 
@@ -81,26 +73,21 @@ func (s *Service) Close(ctx context.Context) error { return s.engine.Close(ctx) 
 //
 //   - "Agent" (Virtual Object): the session — Ask (drive a turn), History (read
 //     transcript), Reset (clear).
-//   - "AgentTools" (keyless service): the agent's companion service.
-//   - Exec — runs a seq tool's multi-step body in its own sub-invocation (so seq
-//     tools may block/orchestrate and still parallelize with siblings). Not
-//     annotated, so discovery ignores it.
-//   - resolve / reject — complete a named signal by (invocation, name). Annotated
-//     with AgentToolAnnotation, so a discovering agent gets them as tools (that's
-//     how the `signal` tool's approval is completed), without any bespoke service.
+//   - "AgentSignals" (keyless service): resolve / reject complete a named signal by
+//     (invocation, name). Annotated with AgentToolAnnotation, so a discovering agent
+//     gets them as tools — that's how the `signal` tool's approval is completed.
 func (s *Service) Definitions() []restate.ServiceDefinition {
 	agent := restate.NewObject("Agent").
 		Handler("Ask", restate.NewObjectHandler(s.Ask)).
 		Handler("History", restate.NewObjectSharedHandler(s.History)).
 		Handler("Reset", restate.NewObjectHandler(s.Reset))
-	tools := restate.NewService(agentToolsService).
-		Handler(execMethod, restate.NewServiceHandler(s.execTool)).
+	signals := restate.NewService(agentSignalsService).
 		Handler("resolve", restate.NewServiceHandler(resolveSignal, restate.WithMetadata(AgentToolAnnotation, "resolve"))).
 		Handler("reject", restate.NewServiceHandler(rejectSignal, restate.WithMetadata(AgentToolAnnotation, "reject")))
-	return []restate.ServiceDefinition{agent, tools}
+	return []restate.ServiceDefinition{agent, signals}
 }
 
-// Signal-completion handlers on AgentTools. resolve/reject a named signal on a target
+// Signal-completion handlers on AgentSignals. resolve/reject a named signal on a target
 // invocation (the one blocked in the `signal` tool); each has the full restate.Context
 // to issue the ctx-level command, and calling one is a durable service call — so
 // discovery exposes them as plain leaf tools.
@@ -141,24 +128,6 @@ func rejectSignal(ctx restate.Context, in signalRejectInput) (signalOK, error) {
 	}
 	restate.RejectSignal(ctx, in.Invocation, in.Name, errors.New(reason))
 	return signalOK{OK: true}, nil
-}
-
-// execReq dispatches one seq-tool call to its registered body.
-type execReq struct {
-	Tool string          `json:"tool"`
-	Arg  json.RawMessage `json:"arg"`
-}
-
-// execTool is the AgentTools/Exec handler: it runs the named seq tool's blocking,
-// multi-step body with THIS invocation's own restate.Context. Reached via
-// RequestFuture from restateInvoker, so several seq tools run as independent,
-// concurrent invocations.
-func (s *Service) execTool(ctx restate.Context, req execReq) (json.RawMessage, error) {
-	t, ok := s.toolByName[req.Tool]
-	if !ok || t.seqHandler == nil {
-		return nil, restate.TerminalErrorf("unknown seq tool %q", req.Tool)
-	}
-	return t.seqHandler(ctx, req.Arg)
 }
 
 // AskInput is one message to a session (the object key is the session id).
@@ -305,10 +274,9 @@ func (r *restateInvoker) Reset() {
 	r.ready = map[int]readyOp{}
 }
 
-// Start submits each new op as an in-flight durable Future (a leaf tool submits
-// in-process via Run/Call/Timer/…; a seq tool is dispatched to its own AgentTools/Exec
-// sub-invocation), keyed by the op's stable handle. An op that can't even be submitted
-// (unknown tool / bad args) is recorded as immediately-settled. Non-blocking.
+// Start submits each new op as an in-flight durable Future (Run/Call/CallObject/Timer/
+// Awakeable/Signal), keyed by the op's stable handle. An op that can't even be
+// submitted (unknown tool / bad args) is recorded as immediately-settled. Non-blocking.
 func (r *restateInvoker) Start(calls []ToolCall) {
 	for _, c := range calls {
 		t, ok := r.tools[c.Tool]
@@ -381,28 +349,15 @@ func (r *restateInvoker) Next(_ context.Context) (StepResult, error) {
 	return StepResult{Handle: h, Value: v}, nil
 }
 
-// submit turns one tool call into an in-flight durable Future WITHOUT blocking. A
-// leaf tool submits on the parent context (in-process, cheap). A seq tool is
-// dispatched to AgentTools/Exec, so its blocking multi-step body runs in its own
-// invocation and this call is just a ResponseFuture the batch driver awaits.
+// submit turns one tool call into an in-flight durable Future WITHOUT blocking
+// (Run/Call/CallObject/Timer/Awakeable/Signal). A multi-step operation is a handler the
+// tool Calls, so it too is just a service-call future the batch driver awaits.
 func (r *restateInvoker) submit(t Tool, c ToolCall) (anyFuture, error) {
-	if t.submit != nil {
-		return t.submit(r.rctx, c.Arg)
+	if t.submit == nil {
+		return nil, restate.TerminalErrorf("tool %q has no submit", c.Tool)
 	}
-	f := restate.Service[json.RawMessage](r.rctx, agentToolsService, execMethod).
-		RequestFuture(execReq{Tool: c.Tool, Arg: c.Arg})
-	return rawFuture{sel: f, get: func() (json.RawMessage, error) { return f.Response() }}, nil
+	return t.submit(r.rctx, c.Arg)
 }
-
-// rawFuture is an anyFuture whose payload is already JSON (a seq tool's
-// sub-invocation returns the tool's marshaled result), so no re-marshaling.
-type rawFuture struct {
-	sel restate.Future
-	get func() (json.RawMessage, error)
-}
-
-func (f rawFuture) selectable() restate.Future           { return f.sel }
-func (f rawFuture) resultJSON() (json.RawMessage, error) { return f.get() }
 
 // --- Model: the OpenAI-backed decision maker ---------------------------------
 

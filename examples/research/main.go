@@ -17,13 +17,10 @@ import (
 
 func main() {
 	agent.Main(agent.RunConfig{
-		// Tools receives the env-resolved client + model so research_topic can capture
-		// them for its own durable summarization call.
-		Tools: func(client openai.Client, model string) []agent.Tool {
+		Tools: func(_ openai.Client, _ string) []agent.Tool {
 			return []agent.Tool{
 				wikiSearchTool(),
 				wikiFetchTool(),
-				researchTopicTool(client, model),
 			}
 		},
 	})

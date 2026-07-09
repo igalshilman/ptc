@@ -12,7 +12,7 @@
 //     restate.WithMetadata(agent.AgentToolAnnotation, "<name>") becomes a tool,
 //     discovered from the Admin API — here reserve_stock (keyed Inventory), risk_score
 //     (RiskCheck), charge_payment (Payments), plus resolve/reject from the framework's
-//     own AgentTools service. No manual wiring; see services.go.
+//     own AgentSignals service. No manual wiring; see services.go.
 //
 //   - The two RESTATE PRIMITIVES that aren't just handler calls, as static tools:
 //     sleep (durable timer) and signal (create + await a named external signal).
@@ -41,7 +41,7 @@ func main() {
 	agent.Main(agent.RunConfig{
 		// Co-deploy the order-fulfillment back-office (handlers annotated for discovery)
 		// so the standalone agent has real services to orchestrate. Signal resolve/reject
-		// tools come from the framework's AgentTools service, not from here.
+		// tools come from the framework's AgentSignals service, not from here.
 		Extra: []restate.ServiceDefinition{
 			inventoryService(),
 			riskCheckService(),

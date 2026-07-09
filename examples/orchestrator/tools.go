@@ -23,7 +23,7 @@ import (
 //
 // Resolving/rejecting a signal by (invocation, name) are ordinary Restate handlers now
 // (the Signals service in services.go), discovered as tools rather than defined here —
-// so this example needs no seq tools / AgentTools/Exec at all.
+// so this example defines no multi-step tools at all.
 
 // ---- sleep (leaf: durable timer) --------------------------------------------
 

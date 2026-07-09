@@ -11,28 +11,20 @@ import (
 	"strings"
 	"time"
 
-	"github.com/openai/openai-go/v3"
 	restate "github.com/restatedev/sdk-go"
 
 	"restatedev/agent"
 )
 
-// The developer's durable tools for a Wikipedia RESEARCH agent. Each becomes a plain
-// async JS function the agent can call; the model can't tell a leaf tool from a seq
-// tool. Two leaf primitives plus one multi-step seq tool:
-//
-//   - wiki_search / wiki_fetch — LEAF tools (agent.NewTool): each does ONE durable
-//     side effect (an HTTP GET, journaled) and returns a Future. A Promise.all over
-//     several of them runs durably IN PARALLEL, in-process.
-//   - research_topic — a SEQ tool (agent.NewSeqTool): a data-dependent sequence
-//     (search → pick best → fetch → LLM-summarize) with the full restate.Context. It
-//     blocks between steps AND makes its own durable model call, which is exactly why
-//     it's a seq tool: it runs in its own sub-invocation, so it may orchestrate freely
-//     and still parallelize with sibling research_topic calls in a Promise.all batch.
+// The developer's durable tools for a Wikipedia RESEARCH agent — two tools, each a
+// single durable side effect (an HTTP GET, journaled) returning a Future. A Promise.all
+// over several of them runs durably IN PARALLEL, in-process. The model does the
+// multi-step reasoning itself (search → fetch → summarize in its answer), so there is
+// no bundled "research" tool — an LLM-in-a-tool would just duplicate the agent.
 //
 // The data source is the public Wikipedia API — no API key, self-contained.
 
-// ---- wiki_search (leaf) -----------------------------------------------------
+// ---- wiki_search ------------------------------------------------------------
 
 type wikiSearchArgs struct {
 	Query string `json:"query" jsonschema:"description=search terms, e.g. \"causes of the French Revolution\""`
@@ -48,8 +40,8 @@ type wikiSearchResult struct {
 	Results []wikiHit `json:"results"`
 }
 
-// wikiSearchTool: a Wikipedia title search as a leaf tool, so several searches in a
-// Promise.all run durably in PARALLEL and are journaled (not re-issued on replay).
+// wikiSearchTool: a Wikipedia title search; several searches in a Promise.all run
+// durably in PARALLEL and are journaled (not re-issued on replay).
 func wikiSearchTool() agent.Tool {
 	return agent.NewTool("wiki_search",
 		`search Wikipedia and return the top matching article titles; use it for a quick lookup or to find the exact title to pass to wiki_fetch. Returns {query, results:[{title, description, url}]}`,
@@ -60,7 +52,7 @@ func wikiSearchTool() agent.Tool {
 		})
 }
 
-// ---- wiki_fetch (leaf) ------------------------------------------------------
+// ---- wiki_fetch -------------------------------------------------------------
 
 type wikiFetchArgs struct {
 	Title string `json:"title" jsonschema:"description=the exact article title to read, as returned by wiki_search"`
@@ -72,7 +64,7 @@ type wikiPage struct {
 	Found   bool   `json:"found"`
 }
 
-// wikiFetchTool: fetch one article's plain-text extract as a leaf tool.
+// wikiFetchTool: fetch one article's plain-text extract.
 func wikiFetchTool() agent.Tool {
 	return agent.NewTool("wiki_fetch",
 		`fetch the plain-text of a Wikipedia article by its EXACT title (use a title from wiki_search). Returns {title, url, extract, found}; the extract is truncated for long articles`,
@@ -83,114 +75,6 @@ func wikiFetchTool() agent.Tool {
 		})
 }
 
-// ---- research_topic (seq) ---------------------------------------------------
-
-type researchArgs struct {
-	Subtopic string `json:"subtopic" jsonschema:"description=ONE focused subtopic to research, e.g. \"causes of the Russian Revolution\""`
-	Focus    string `json:"focus,omitempty" jsonschema:"description=optional angle or question to focus the notes on"`
-}
-type researchNote struct {
-	Subtopic string `json:"subtopic"`
-	Source   string `json:"source"` // the Wikipedia article title actually read
-	URL      string `json:"url"`
-	Summary  string `json:"summary"` // concise, model-written notes drawn from the article
-}
-
-// researchTopicTool: the showcase SEQ tool. It runs a whole research sub-pipeline as
-// its own durable sub-invocation — search, pick the best article, read it, then make
-// a durable LLM call to distill notes. Every step is journaled, so on replay nothing
-// re-runs (no re-fetch, no re-billing the summary). Because it's a seq tool, firing
-// several via Promise.all researches multiple subtopics in PARALLEL, each in its own
-// invocation. It captures the model client + model id from setup() — a tool is plain
-// developer code and may use whatever it needs.
-func researchTopicTool(client openai.Client, model string) agent.Tool {
-	return agent.NewSeqTool("research_topic",
-		`deeply research ONE focused subtopic end-to-end: it searches Wikipedia, picks the best article, reads it, and returns concise factual notes. A durable multi-step tool — fire SEVERAL in a single Promise.all to research subtopics in PARALLEL. Prefer this over wiki_search+wiki_fetch when you want ready-to-use notes. Returns {subtopic, source, url, summary}`,
-		func(ctx restate.Context, a researchArgs) (researchNote, error) {
-			if strings.TrimSpace(a.Subtopic) == "" {
-				return researchNote{}, restate.TerminalErrorf("research_topic needs a non-empty subtopic")
-			}
-
-			// 1. Search Wikipedia (durable step).
-			sr, err := restate.Run(ctx, func(rc restate.RunContext) (wikiSearchResult, error) {
-				return wikiSearch(rc, a.Subtopic, 5)
-			}, restate.WithName("search"))
-			if err != nil {
-				return researchNote{}, err
-			}
-			if len(sr.Results) == 0 {
-				return researchNote{}, restate.TerminalErrorf("no Wikipedia results for %q", a.Subtopic)
-			}
-
-			// 2. Pick the best readable article: try the top hits until one fetches.
-			var page wikiPage
-			for i, hit := range sr.Results {
-				if i >= 3 {
-					break
-				}
-				title := hit.Title
-				p, err := restate.Run(ctx, func(rc restate.RunContext) (wikiPage, error) {
-					return wikiFetch(rc, title)
-				}, restate.WithName(fmt.Sprintf("fetch-%d", i)))
-				if err != nil {
-					return researchNote{}, err
-				}
-				if p.Found {
-					page = p
-					break
-				}
-			}
-			if !page.Found {
-				return researchNote{}, restate.TerminalErrorf("no readable Wikipedia article found for %q", a.Subtopic)
-			}
-
-			// 3. Distill notes with a durable model call (journaled: not re-billed on replay).
-			summary, err := restate.Run(ctx, func(rc restate.RunContext) (string, error) {
-				return summarize(rc, client, model, a.Subtopic, a.Focus, page.Extract)
-			}, restate.WithName("summarize"))
-			if err != nil {
-				return researchNote{}, err
-			}
-
-			return researchNote{Subtopic: a.Subtopic, Source: page.Title, URL: page.URL, Summary: summary}, nil
-		})
-}
-
-// summarize asks the model to distill factual notes on the subtopic from the article
-// text. Runs inside a durable restate.Run (in research_topic), so the call is
-// journaled — a replay returns the captured notes instead of calling OpenAI again.
-// A cheaper model could be used here than the agent's planner; we reuse the same one.
-func summarize(ctx context.Context, client openai.Client, model, subtopic, focus, text string) (string, error) {
-	// Bound the model call so a stalled connection can't hang this sub-invocation
-	// indefinitely (the parent Ask awaits it under the session lock). On timeout the
-	// call returns a non-terminal error, so the durable step is retried.
-	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
-	defer cancel()
-
-	const system = "You are a meticulous research assistant. Read the SOURCE TEXT and write concise, factual notes on the given subtopic as short bullet points. Use ONLY facts present in the source; never invent. If the source does not cover the subtopic, say so plainly."
-	var b strings.Builder
-	fmt.Fprintf(&b, "Subtopic: %s\n", subtopic)
-	if strings.TrimSpace(focus) != "" {
-		fmt.Fprintf(&b, "Focus the notes on: %s\n", focus)
-	}
-	fmt.Fprintf(&b, "\nSOURCE TEXT:\n%s", truncateRunes(text, 12000))
-
-	resp, err := client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
-		Model: openai.ChatModel(model),
-		Messages: []openai.ChatCompletionMessageParamUnion{
-			openai.SystemMessage(system),
-			openai.UserMessage(b.String()),
-		},
-	})
-	if err != nil {
-		return "", err // transient: Restate retries the Run with backoff
-	}
-	if len(resp.Choices) == 0 {
-		return "", restate.TerminalErrorf("summarizer returned no choices")
-	}
-	return strings.TrimSpace(resp.Choices[0].Message.Content), nil
-}
-
 // ---- Wikipedia API client ---------------------------------------------------
 
 const (
@@ -198,9 +82,9 @@ const (
 	wikiUserAgent = "quickjs-worker-go-demo/1.0 (https://github.com/restatedev; a durable CodeAct agent example)"
 )
 
-// wikiGet performs a Wikipedia API GET with the etiquette-required User-Agent. It
-// runs inside a durable step (RunContext), so a transient error is retried and a
-// success is journaled. 5xx/429 are transient (retry); other non-200s are terminal.
+// wikiGet performs a Wikipedia API GET with the etiquette-required User-Agent. It runs
+// inside a durable step (RunContext), so a transient error is retried and a success is
+// journaled. 5xx/429 are transient (retry); other non-200s are terminal.
 func wikiGet(ctx context.Context, params url.Values) ([]byte, error) {
 	// Bound each attempt: nothing else bounds a tool call's wall-clock, so without this
 	// a stalled / half-open connection would hang the invocation and hold the session

@@ -19,7 +19,7 @@ import (
 //   - Payments  (Service)               charge_payment  — charge a customer
 //
 // The signal-completion tools (resolve/reject) are NOT defined here — they're handlers
-// on the framework's own AgentTools service (see agent/service.go), discovered the same
+// on the framework's own AgentSignals service (see agent/service.go), discovered the same
 // way. In real use you'd annotate handlers across your own services and point the agent
 // at them; these keep the demo self-contained.
 

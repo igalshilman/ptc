@@ -74,8 +74,8 @@ func fetchHandlers(ctx context.Context, cfg DiscoverConfig) ([]handlerDescriptor
 		return nil, err
 	}
 	// The Agent session object is never exposed (calling your own session deadlocks).
-	// AgentTools is NOT denied: its Exec handler is unannotated so the annotation gate
-	// skips it, while its annotated resolve/reject handlers are meant to be discovered.
+	// The framework's AgentSignals service is NOT denied — its resolve/reject handlers
+	// are annotated and meant to be discovered as tools.
 	deny := map[string]bool{agentObjectService: true}
 	for _, d := range cfg.Deny {
 		deny[d] = true

@@ -8,30 +8,27 @@ import (
 	restate "github.com/restatedev/sdk-go"
 )
 
-// Tool is a developer-registered capability the agent can call. To the JS program
-// every tool is just a plain async function; internally a tool is EITHER:
+// Tool is a developer-registered capability the agent can call. To the JS program a
+// tool is just a plain async function; internally its body performs ONE non-blocking
+// submission and returns the resulting Future (via Run / Call / CallObject / Timer /
+// Awakeable / Signal). A batch of tools fired from a single Promise.all runs durably
+// IN PARALLEL, in-process, driven by one restate.WaitFirst.
 //
-//   - a leaf op (NewTool): its body performs ONE non-blocking submission and
-//     returns the resulting Future (via Run/Call/CallObject/Timer/Awakeable). A
-//     batch of leaf tools fired from a single Promise.all runs durably IN PARALLEL,
-//     in-process, driven by one restate.Wait.
-//   - a sequence (NewSeqTool): an ordinary blocking, multi-step handler with the
-//     full restate.Context. It runs in its OWN sub-invocation (via AgentTools/Exec)
-//     so it may await/branch/orchestrate freely and STILL parallelize with sibling
-//     tools — at the cost of one invocation hop.
+// A multi-step, blocking operation is NOT a special tool kind — model it as a Restate
+// handler the tool CALLS (agent.Call / CallObject, or auto-discovered via DiscoverTools):
+// the call is a non-blocking future, and the handler runs in its own invocation where
+// it may block/branch freely.
 //
-// Params/Result are the JSON Schemas of the argument and return types, surfaced to
-// the model. Exactly one of submit/seqHandler is set.
+// Params/Result are the JSON Schemas of the argument and return types, surfaced to the
+// model.
 type Tool struct {
 	Name        string
 	Description string
 	Params      json.RawMessage // arg schema, reflected from A
 	Result      json.RawMessage // return schema, reflected from R
 
-	// leaf: produce an in-flight Future on the parent context (non-blocking).
+	// submit produces an in-flight Future on the parent context (non-blocking).
 	submit func(ctx restate.Context, arg json.RawMessage) (anyFuture, error)
-	// sequence: a blocking multi-step body, run as its own sub-invocation.
-	seqHandler func(ctx restate.Context, arg json.RawMessage) (json.RawMessage, error)
 }
 
 // Future is an in-flight durable operation that will yield R. A leaf tool returns
@@ -114,10 +111,10 @@ func Signal[R any](ctx restate.Context, name string, opts ...restate.SignalOptio
 	return Future[R]{sel: f, get: func() (R, error) { return f.Result() }}
 }
 
-// NewTool registers a LEAF tool: its body performs ONE non-blocking submission and
-// returns the resulting Future. The arg schema is reflected from A and the result
-// schema from R (both surfaced to the model); raw args are unmarshaled into A. A
-// batch of leaf tools fired via Promise.all executes durably IN PARALLEL.
+// NewTool registers a tool: its body performs ONE non-blocking submission and returns
+// the resulting Future. The arg schema is reflected from A and the result schema from R
+// (both surfaced to the model); raw args are unmarshaled into A. A batch of tools fired
+// via Promise.all executes durably IN PARALLEL.
 func NewTool[A, R any](name, description string, fn func(ctx restate.Context, args A) (Future[R], error)) Tool {
 	return Tool{
 		Name:        name,
@@ -134,40 +131,12 @@ func NewTool[A, R any](name, description string, fn func(ctx restate.Context, ar
 				return nil, err
 			}
 			if fut.sel == nil {
-				// A leaf tool must return a Future built by Run/Call/CallObject/Timer/
-				// Awakeable. A zero-value Future{} would pass a nil restate.Future to the
-				// batch driver → nil-panic → deterministic → retried forever. Reject it
-				// cleanly instead.
-				return nil, restate.TerminalErrorf("tool %q returned an empty Future (build it with agent.Run/Call/CallObject/Timer/Awakeable)", name)
+				// A tool must return a Future built by Run/Call/CallObject/Timer/Awakeable/
+				// Signal. A zero-value Future{} would pass a nil restate.Future to the batch
+				// driver → nil-panic → deterministic → retried forever. Reject it cleanly.
+				return nil, restate.TerminalErrorf("tool %q returned an empty Future (build it with agent.Run/Call/CallObject/Timer/Awakeable/Signal)", name)
 			}
 			return fut, nil
-		},
-	}
-}
-
-// NewSeqTool registers a SEQUENCE tool: an ordinary blocking, multi-step handler
-// with the full restate.Context (service calls, durable timers, awakeables, nested
-// runs, data-dependent steps). It runs in its OWN sub-invocation, so blocking is
-// fine and it still parallelizes with sibling tools in a Promise.all batch — at the
-// cost of one invocation hop. Because it runs on the keyless tool service it is
-// session-stateless (pass what it needs as args) and must not call back into its
-// own Agent session (the parent holds that key's lock while awaiting it).
-func NewSeqTool[A, R any](name, description string, fn func(ctx restate.Context, args A) (R, error)) Tool {
-	return Tool{
-		Name:        name,
-		Description: description,
-		Params:      reflectSchema[A](),
-		Result:      reflectSchema[R](),
-		seqHandler: func(ctx restate.Context, raw json.RawMessage) (json.RawMessage, error) {
-			a, err := unmarshalArgs[A](name, raw)
-			if err != nil {
-				return nil, err
-			}
-			out, err := fn(ctx, a)
-			if err != nil {
-				return nil, err
-			}
-			return json.Marshal(out)
 		},
 	}
 }

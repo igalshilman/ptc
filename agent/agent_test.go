@@ -451,9 +451,8 @@ func TestToolSchemaSurfaced(t *testing.T) {
 	}
 }
 
-// TestToolShapeAndSchemas: NewTool is a leaf (submit set, seqHandler nil), NewSeqTool
-// is a sequence (seqHandler set, submit nil), and both reflect arg + result schemas
-// from their type params.
+// TestToolShapeAndSchemas: NewTool sets submit and reflects the arg + result schemas
+// from its type params.
 func TestToolShapeAndSchemas(t *testing.T) {
 	type in struct {
 		X int `json:"x"`
@@ -461,21 +460,15 @@ func TestToolShapeAndSchemas(t *testing.T) {
 	type out struct {
 		Y string `json:"y"`
 	}
-	leaf := NewTool("leaf", "d", func(_ restate.Context, _ in) (Future[out], error) { return Future[out]{}, nil })
-	if leaf.submit == nil || leaf.seqHandler != nil {
-		t.Fatalf("NewTool must set submit (leaf), not seqHandler")
+	tl := NewTool("leaf", "d", func(_ restate.Context, _ in) (Future[out], error) { return Future[out]{}, nil })
+	if tl.submit == nil {
+		t.Fatal("NewTool must set submit")
 	}
-	seq := NewSeqTool("seq", "d", func(_ restate.Context, _ in) (out, error) { return out{}, nil })
-	if seq.seqHandler == nil || seq.submit != nil {
-		t.Fatalf("NewSeqTool must set seqHandler (sequence), not submit")
+	if !strings.Contains(string(tl.Params), `"x"`) {
+		t.Fatalf("arg schema missing x: %s", tl.Params)
 	}
-	for _, tl := range []Tool{leaf, seq} {
-		if !strings.Contains(string(tl.Params), `"x"`) {
-			t.Fatalf("%s: arg schema missing x: %s", tl.Name, tl.Params)
-		}
-		if !strings.Contains(string(tl.Result), `"y"`) {
-			t.Fatalf("%s: result schema missing y: %s", tl.Name, tl.Result)
-		}
+	if !strings.Contains(string(tl.Result), `"y"`) {
+		t.Fatalf("result schema missing y: %s", tl.Result)
 	}
 }
 
