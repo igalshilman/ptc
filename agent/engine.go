@@ -242,19 +242,19 @@ func (e *Engine) RunLive(ctx context.Context, script string, inv Invoker) (resul
 	g.runs++
 	healthy := false
 	defer func() {
-		if r := recover(); r != nil {
-			result = ""
-			switch v := r.(type) {
-			case fatalError:
-				err = v.err
-			default:
-				if ce := ctx.Err(); ce != nil {
-					err = fmt.Errorf("program interrupted: %w", ce)
-				} else {
-					err = fmt.Errorf("guest execution failed: %v", r)
-				}
-			}
-		}
+		// if r := recover(); r != nil {
+		// 	result = ""
+		// 	switch v := r.(type) {
+		// 	case fatalError:
+		// 		err = v.err
+		// 	default:
+		// 		if ce := ctx.Err(); ce != nil {
+		// 			err = fmt.Errorf("program interrupted: %w", ce)
+		// 		} else {
+		// 			err = fmt.Errorf("guest execution failed: %v", r)
+		// 		}
+		// 	}
+		// }
 		// Reuse the instance unless a trap fired (recovered above, so healthy is still
 		// false). A fresh `start` resets the guest state, so a mere program error is fine.
 		e.release(ctx, g, healthy && ctx.Err() == nil)
