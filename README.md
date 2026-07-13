@@ -76,6 +76,42 @@ The handler runs in its own invocation, where it may block/branch freely; to the
 driver the call is just another service-call future. See [`DESIGN.md`](./DESIGN.md) for
 why.
 
+### A discovered tool can be in any language (e.g. TypeScript)
+
+Discovery only reads a handler's `metadata["restate/agent"]` from the Restate Admin API,
+which is language-agnostic — so a tool the agent orchestrates doesn't have to be Go. The
+same `risk_score` tool as a **TypeScript** Restate service ([`@restatedev/restate-sdk`](https://www.npmjs.com/package/@restatedev/restate-sdk)):
+
+```ts
+import * as restate from "@restatedev/restate-sdk";
+
+const riskCheck = restate.service({
+  name: "RiskCheck",
+  handlers: {
+    // `metadata` is exposed via the Admin API; the `restate/agent` key opts the handler
+    // into discovery and its value becomes the tool name (same contract as Go's
+    // restate.WithMetadata(agent.AgentToolAnnotation, "risk_score")).
+    score: restate.handlers.handler(
+      { metadata: { "restate/agent": "risk_score" } },
+      async (ctx: restate.Context, input: { customer: string; amount: number }) => {
+        const flagged = input.amount >= 1000;
+        return {
+          score: Math.floor(input.amount / 20),
+          flagged,
+          reason: flagged ? "order total >= $1000 — needs human approval" : "within limit",
+        };
+      }
+    ),
+  },
+});
+
+restate.endpoint().bind(riskCheck).listen(9081); // its own deployment; register it too
+```
+
+Register this deployment alongside the agent and it shows up as the `risk_score` tool,
+no Go changes. (Add `input`/`output` serde — e.g. via `@restatedev/restate-sdk-zod` — to
+give the model a JSON Schema for the arguments; otherwise the tool is schema-less.)
+
 ## Examples
 
 Two runnable demos under `examples/`, meant to run as two separate Restate deployments:
@@ -98,6 +134,12 @@ go test ./...                                           # engine, sandbox, loop,
 OPENAI_API_KEY=sk-...  go run ./examples/orchestrator   # the agent, on :9080
                        go run ./examples/backoffice     # the discovered handlers, on :9081
 ```
+
+> **Run BOTH, and register BOTH.** The agent and the back-office are two separate Restate
+> deployments. Against a real Restate runtime you must register **both** with the Admin
+> API (the agent on `:9080` *and* the back-office on `:9081`) — otherwise discovery finds
+> no back-office handlers and the agent has only its `sleep`/`signal` tools. See
+> [Against a real Restate runtime](#against-a-real-restate-runtime) below.
 
 A [Nix](https://nixos.org) dev shell with the full toolchain (Go, plus Rust with the
 `wasm32-wasip1` target for `make guest-rs`) is provided — `nix develop` (pins nixpkgs
