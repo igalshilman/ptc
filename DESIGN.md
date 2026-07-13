@@ -120,20 +120,17 @@ deterministic loop order; and settling the winner drives the program identically
 cleanup, by design), and `Reset` clears the host's leftover handle state before the next
 program.
 
-> **Known limitation — `Promise.race` winner is not proven replay-stable.** When two or
-> more futures are *already complete at the same `WaitFirst` poll* (which can happen on
-> replay, where the runtime front-loads journaled completions), `restate.WaitFirst` in
-> sdk-go v1.0.0 picks the winner by **Go map-iteration order**
-> (`internal/restatecontext/wait_iterator.go`), not by journaled-completion order — so a
-> replay could resolve a *different* `Promise.race` / `Promise.any` branch than the live
-> run. `Promise.all` is unaffected (order-independent). This lives entirely in the SDK
-> (v1.0.0 is the latest; sorting our `sels` doesn't help — `WaitIter` re-copies into its
-> own map), so it isn't fixable from this module and has no offline test (the state
-> machine is an `internal/` package we can't import). It is most likely **fail-loud** (a
-> divergent replay trips Restate's journal check and errors the invocation) rather than a
-> silent wrong answer. To reproduce: run against a real Restate runtime, drive a
-> `Promise.race` over two near-simultaneous tools, and force a mid-invocation replay. The
-> real fix is a deterministic tie-break upstream in the SDK.
+The one subtle case is which op **wins a `Promise.race`** when two or more futures are
+*already complete at the same `WaitFirst` poll* (which can happen on replay, where the
+runtime front-loads journaled completions). `restate.WaitFirst` breaks that tie by the
+order the futures are passed to it — so `restateInvoker.Next` passes them in
+**ascending-handle order** (`sort.Ints`), and since handles are deterministic per
+program the winner is reproduced across replays. This relies on the SDK's *ordered*
+`WaitIterator` (a slice, not a map): earlier sdk-go (≤ v1.0.0) tie-broke by Go
+map-iteration order, so the winner was not replay-stable and sorting `sels` didn't help
+(the iterator re-copied into its own map); it is fixed as of
+`sdk-go v1.0.1-0.20260713113405-df79b269735f`, which `go.mod` pins. `Promise.all` never
+depended on this (order-independent).
 
 ## Why not the alternatives (considered, rejected)
 

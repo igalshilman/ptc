@@ -212,9 +212,9 @@ next `start` (instances are pooled and checked out exclusively, so only one prog
 ever live per instance). On a Restate replay the host re-runs `start` from the top and
 feeds the journaled completions back in `WaitFirst` order; because the clock, randomness,
 and handle counter are all frozen/deterministic, the program re-derives the same op
-sequence. (One caveat: the *winner* of a `Promise.race` over futures that complete at the
-same instant may not be replay-stable — an SDK-level tie-break issue documented under
-"Known limitation" in [`DESIGN.md`](./DESIGN.md).) QuickJS is built with `NDEBUG` so its teardown sweep doesn't trip a
+sequence — including which branch of a `Promise.race` wins, because the host drives
+`WaitFirst` in a deterministic ascending-handle order (see [`DESIGN.md`](./DESIGN.md)).
+QuickJS is built with `NDEBUG` so its teardown sweep doesn't trip a
 debug refcount assert, and the guest drains throwing microtasks fully (leaking a phantom
 `JobException` ref) to avoid an unbalanced `JS_FreeContext`.
 
@@ -222,8 +222,8 @@ debug refcount assert, and the guest drains throwing microtasks fully (leaking a
 
 - **Replay:** on crash/replay the handler re-runs the Go loop from the top; each
   journaled model call and tool call returns its captured value instead of re-executing,
-  and the host feeds the completions back through `WaitFirst` — so the program re-derives
-  identically (with the one `Promise.race` tie-break caveat noted above). Deterministic
+  and the host feeds the completions back through `WaitFirst` (in a deterministic
+  ascending-handle order) — so the program re-derives identically. Deterministic
   give-ups (`ErrMaxRounds`) are surfaced as
   *terminal* errors so Restate never retries them forever; session state is persisted
   only on success.

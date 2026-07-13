@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -334,9 +335,16 @@ func (r *restateInvoker) Start(calls []ToolCall) {
 }
 
 // Next drives the in-flight ops with ONE restate.WaitFirst and returns the FIRST to
-// settle — in journaled order on replay, so which op "wins" a race is reproduced. The
-// second return is non-nil only for an invocation-fatal condition (e.g. a Restate
-// cancellation); it is returned, not fed back to the guest as a per-op rejection.
+// settle. The second return is non-nil only for an invocation-fatal condition (e.g. a
+// Restate cancellation); it is returned, not fed back to the guest as a per-op rejection.
+//
+// Futures are passed in ASCENDING-HANDLE order, which makes the Promise.race winner
+// replay-stable: restate.WaitFirst breaks a tie — ≥2 futures already complete at the
+// same poll, which can happen on replay where the runtime front-loads journaled
+// completions — by the order they are passed (the ordered WaitIterator, sdk-go
+// >= v1.0.1-…-df79b26). Handles are themselves deterministic per program, so a fixed
+// order reproduces the same winner. (Ranging r.pending, a Go map, would pass them in
+// randomized order and reintroduce the nondeterminism.)
 func (r *restateInvoker) Next() (StepResult, error) {
 	if len(r.pending) == 0 {
 		// The guest quiesced still running but nothing is in flight — the program
@@ -345,16 +353,23 @@ func (r *restateInvoker) Next() (StepResult, error) {
 		// surface it as a clean terminal error instead.
 		return StepResult{}, restate.TerminalErrorf("program made no progress (awaiting with no pending operations)")
 	}
-	sels := make([]restate.Future, 0, len(r.pending))
-	for _, op := range r.pending {
-		sels = append(sels, op.fut.selectable())
+	handles := make([]int, 0, len(r.pending))
+	for h := range r.pending {
+		handles = append(handles, h)
+	}
+	sort.Ints(handles)
+	sels := make([]restate.Future, len(handles))
+	for i, h := range handles {
+		sels[i] = r.pending[h].fut.selectable()
 	}
 	winner, cancelled := restate.WaitFirst(r.rctx, sels...)
 	if cancelled != nil {
 		return StepResult{}, cancelled
 	}
-	for h, op := range r.pending {
-		if op.fut.selectable() == winner {
+	for i, sel := range sels {
+		if sel == winner {
+			h := handles[i]
+			op := r.pending[h]
 			delete(r.pending, h)
 			return settle(h, op), nil
 		}

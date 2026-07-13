@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/invopop/jsonschema v0.14.0
 	github.com/openai/openai-go/v3 v3.41.0
-	github.com/restatedev/sdk-go v1.0.0
+	github.com/restatedev/sdk-go v1.0.1-0.20260713113405-df79b269735f
 	github.com/tetratelabs/wazero v1.9.0
 )
 

@@ -220,9 +220,9 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
 ## Invariants to preserve (don't regress these)
 
 - **Determinism / replay:** on a Restate replay `guest.start` re-runs the program from
-  the top and the host feeds the journaled completions back through `WaitFirst`, so the
-  program re-derives identically (except the `Promise.race` winner tie-break — see the
-  CAVEAT in the Parallel & race bullet) — hence its clock & randomness MUST be
+  the top and the host feeds the journaled completions back through `WaitFirst` (driven in
+  ascending-handle order so even a `Promise.race` winner is reproduced — see the Parallel &
+  race bullet), so the program re-derives identically — hence its clock & randomness MUST be
   frozen (sandbox.go's `detPreludeJS` overrides `Math.random`, the `Date` constructor,
   `Date.now`, `crypto`, `performance.now`; engine.go pins the WASI clock/rand via wazero
   `WithWalltime`/`WithRandSource` as a backstop). ONE seed is minted per program (from
@@ -236,11 +236,12 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
   FIRST to settle). Submitting the whole step before awaiting is what makes a
   `Promise.all` batch run in PARALLEL; returning first-completion is what makes
   `Promise.race`/timeouts work (`TestParallelTools`, `TestPromiseAllFrontier`,
-  `TestPromiseRaceFirstWins`, `TestLargeFrontier`). CAVEAT: the `Promise.race` *winner* is
-  not proven replay-stable — if ≥2 futures are complete at one `WaitFirst` poll, sdk-go
-  v1.0.0 breaks the tie by Go map-iteration order, not journaled order (an SDK-level
-  issue, not fixable here; `TestPromiseRaceFirstWins` uses an in-memory invoker and does
-  NOT exercise it). See the "Known limitation" note in `DESIGN.md`. An op that can't even be submitted
+  `TestPromiseRaceFirstWins`, `TestLargeFrontier`). `Next` passes the futures to
+  `WaitFirst` in ASCENDING-HANDLE order (`sort.Ints`) so the `Promise.race` winner is
+  replay-stable when ≥2 are complete at one poll — `WaitFirst` breaks the tie by input
+  order, and handles are deterministic. (This needs the SDK's ordered `WaitIterator`;
+  ≤ v1.0.0 tie-broke by Go map order and sorting didn't help — `go.mod` pins the fixed
+  `sdk-go v1.0.1-0.20260713113405-df79b269735f`. See `DESIGN.md`.) An op that can't even be submitted
   (unknown tool / bad args) is a FATAL condition: `Start` **panics**, aborting the whole
   program — it is NOT demoted to a per-op rejection the JS could swallow. A leaf tool that
   returns a zero-value `Future{}` is likewise rejected at `submit` with a terminal error
