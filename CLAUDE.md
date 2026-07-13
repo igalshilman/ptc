@@ -320,7 +320,7 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
 - **Demo tools are illustrative:** the orchestrator's `Inventory`/`RiskCheck`/`Payments`
   use toy heuristics (seed 100 stock/SKU, flag orders ≥ $1000) — replace with real
   capabilities.
-- **Committed on `main`** (HEAD `288bccf`).
+- **Committed on `main`.**
 
 ## Dependencies (all published; no replace)
 - `github.com/restatedev/sdk-go v1.0.0` (Restate Go SDK)

@@ -157,8 +157,10 @@ refcount assert.
   `set_memory_limit`/`set_max_stack_size`); the sole backstop against a runaway
   tool-calling loop is `maxProgramSteps` (each step settles one op, so this caps total
   ops — parallel width and sequential depth both count). Malformed model output and
-  ordinary tool errors are fed back as observations rather than being fatal; a Restate
-  cancellation propagates as a fatal panic (not a swallowable per-tool failure).
+  ordinary tool errors (rejected promises) are fed back as observations rather than being
+  fatal; an unsubmittable op (unknown tool) and a Restate cancellation are fatal instead —
+  the cancellation is *returned* (never swallowed as a per-tool failure), while a genuine
+  guest trap propagates as a panic.
 
 The design was adversarially reviewed; [`CLAUDE.md`](./CLAUDE.md) records the invariants
 and known limitations.
