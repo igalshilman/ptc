@@ -1,4 +1,4 @@
-# quickjs-worker-go
+# Programmatic Tool Calling with Restate
 
 A durable CodeAct agent built on [Restate](https://restate.dev). On each round,
 the model writes a small JavaScript program. That program runs in an embedded
