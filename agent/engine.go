@@ -20,6 +20,7 @@ package agent
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,6 +31,16 @@ import (
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 	"github.com/tetratelabs/wazero/sys"
 )
+
+//go:generate make -C .. guest-rs
+
+// guestWasm is the compiled QuickJS guest, embedded so the binary is self-contained.
+// It is host-agnostic — it knows nothing about Restate or the tools layered on top —
+// and is a committed, prebuilt artifact: rebuild it with `make guest-rs` (Rust/rquickjs)
+// when guest-rs/ changes. NewEngine compiles it into the wazero runtime.
+//
+//go:embed quickjs_guest.wasm
+var guestWasm []byte
 
 // The WASI clock/rand are pinned to these FIXED constants on every instance. They
 // must never vary (a pooled instance's WASI config is bound at instantiation). The
@@ -71,6 +82,24 @@ type guestStep struct {
 	R     json.RawMessage `json:"r"`
 	Ops   []ToolCall      `json:"ops"`
 	Error string          `json:"error"`
+}
+
+// ToolCall is one operation the program started: a stable, deterministic handle plus
+// the tool name and its JSON argument. It is also the wire shape the guest emits (it
+// unmarshals directly out of guestStep.Ops), and the type Invoker.Start consumes.
+type ToolCall struct {
+	Handle int             `json:"handle"`
+	Tool   string          `json:"name"`
+	Arg    json.RawMessage `json:"arg"`
+}
+
+// StepResult is the settlement of one operation that Invoker.Next returns: the handle it
+// belongs to and either a JSON value (Value) or, when the op failed, an Err (delivered to
+// the guest as a rejected promise). It is the counterpart to ToolCall on the way back in.
+type StepResult struct {
+	Handle int
+	Value  json.RawMessage // valid JSON on success (empty → treated as null)
+	Err    error           // non-nil iff the op failed
 }
 
 // maxProgramSteps bounds the drive loop. In the live model each step settles ONE

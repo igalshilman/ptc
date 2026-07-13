@@ -30,10 +30,9 @@ quickjs-worker-go/          project root — run all `go` commands here
 │       ├── main.go           binds the services on :9081 (plain restate server, no agent)
 │       └── services.go       Inventory / RiskCheck / Payments — annotated for discovery
 ├── agent/                  package agent — reusable durable-CodeAct engine (INFRA)
-│   ├── engine.go            wazero driver + instance pool + RunLive (the live-coroutine drive loop); WASI clock/rand pin
+│   ├── engine.go            wazero driver + instance pool + RunLive (the live-coroutine drive loop); WASI clock/rand pin; //go:embed of the guest; the host↔guest wire types (guestStep/ToolCall/StepResult)
 │   ├── guest.go             cached guest exports (guest_alloc/dealloc/start/resolve/reject) + linear-memory helpers
-│   ├── wasm.go              //go:embed quickjs_guest.wasm
-│   ├── sandbox.go           assembles each program's script (determinism prelude + live tool bridge + program) from JS raw-string constants; Invoker interface
+│   ├── sandbox.go           assembles each program's script (determinism prelude + live tool bridge + program) from JS raw-string constants; ToolSpec + Invoker interface
 │   ├── loop.go              RunAgent (the Go loop) + Model/Decision/Conversation/Turn + BuildSystemPrompt
 │   ├── tool.go              Tool, NewTool (leaf→Future); Future[R] + Run/Call/CallObject/Timer/Awakeable/Signal helpers; reflected arg+result schemas
 │   ├── discover.go          Admin-API handler discovery: DiscoverConfig, AgentToolAnnotation, DiscoverTools, toolFromDescriptor

@@ -71,9 +71,6 @@ func (s *Sandbox) SetDeterminism(seed, nowMillis int64) {
 	s.nowMillis = nowMillis
 }
 
-// Tools exposes the registered tool specs (used to build the model prompt).
-func (s *Sandbox) Tools() []ToolSpec { return s.inv.Tools() }
-
 // RunProgram evaluates the model-generated program to completion, returning its
 // `return` value encoded as JSON. A thrown JS error or a rejected tool promise
 // surfaces as a non-nil error (which the loop feeds back to the model).
@@ -184,22 +181,4 @@ func (s *Sandbox) toolBridge() string {
 	}
 	namesJSON, _ := json.Marshal(names)
 	return "globalThis.__toolNames = " + string(namesJSON) + ";\n" + bridgeJS
-}
-
-// ToolCall is one operation the program started: a stable, deterministic handle plus
-// the tool name and its JSON argument. It is also the wire shape the guest emits (see
-// guestStep.Ops), so it unmarshals directly from the guest's step blob.
-type ToolCall struct {
-	Handle int             `json:"handle"`
-	Tool   string          `json:"name"`
-	Arg    json.RawMessage `json:"arg"`
-}
-
-// StepResult is the settlement of one operation that the Invoker's Next returns: the
-// handle it belongs to and either a JSON value (Value) or, when the op failed, an Err
-// (delivered to JS as a rejected promise).
-type StepResult struct {
-	Handle int
-	Value  json.RawMessage // valid JSON on success (empty → treated as null)
-	Err    error           // non-nil iff the op failed
 }
