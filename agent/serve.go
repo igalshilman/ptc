@@ -31,8 +31,9 @@ type RunConfig struct {
 	Discover *DiscoverConfig
 	// MaxRounds is the per-message loop budget (0 → default 10).
 	MaxRounds int
-	// Extra are additional Restate services to bind alongside the agent — e.g. the
-	// back-office handlers the orchestrator example discovers and calls. Optional.
+	// Extra are additional Restate service definitions to bind in the SAME deployment as
+	// the agent (served on AGENT_ADDR). Optional — a discovered handler typically lives in
+	// its own deployment (see examples/backoffice) rather than here.
 	Extra []restate.ServiceDefinition
 }
 

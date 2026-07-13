@@ -21,11 +21,14 @@ paths, no `replace`. `go build ./...` works from anywhere.
 
 ```
 quickjs-worker-go/          project root — run all `go` commands here
-├── examples/               runnable demo binaries (USER code) — each is a package main
-│   └── orchestrator/        an order-fulfillment agent that discovers back-office handlers
-│       ├── main.go           agent.Main{Discover + Extra + static tools}
-│       ├── services.go       Inventory / RiskCheck / Payments — the discovered back-office
-│       └── tools.go          the `sleep` (Timer) and `signal` (named-signal approval) tools
+├── examples/               runnable demo binaries (USER code) — each is a package main,
+│   │                        meant to run as SEPARATE Restate deployments
+│   ├── orchestrator/        an order-fulfillment agent that discovers back-office handlers
+│   │   ├── main.go           agent.Main{Discover + static tools}
+│   │   └── tools.go          the `sleep` (Timer) and `signal` (named-signal approval) tools
+│   └── backoffice/          standalone deployment of the handlers the agent discovers
+│       ├── main.go           binds the services on :9081 (plain restate server, no agent)
+│       └── services.go       Inventory / RiskCheck / Payments — annotated for discovery
 ├── agent/                  package agent — reusable durable-CodeAct engine (INFRA)
 │   ├── engine.go            wazero driver + instance pool + RunLive (the live-coroutine drive loop); WASI clock/rand pin
 │   ├── guest.go             cached guest exports (guest_alloc/dealloc/start/resolve/reject) + linear-memory helpers
@@ -42,9 +45,11 @@ quickjs-worker-go/          project root — run all `go` commands here
 └── guest-rs/               the QuickJS guest: Rust/rquickjs → wasm32-wasip1 (`make guest-rs`)
 ```
 
-- **Entry command:** `go run ./examples/orchestrator` (the module root and `agent/` are
-  NOT runnable — no `main`). The example is a tiny `main()` that hands a tool set to
-  `agent.Main` (in `serve.go`).
+- **Entry commands:** `go run ./examples/orchestrator` (the agent) and, as a separate
+  deployment, `go run ./examples/backoffice` (the handlers it discovers) — the module
+  root and `agent/` are NOT runnable (no `main`). The orchestrator is a tiny `main()`
+  that hands a tool set to `agent.Main` (in `serve.go`); the back-office is a plain
+  Restate service deployment.
 - **Public API** the example uses from the `agent` package:
   - lifecycle: `Config`, `NewService`, `Service.Definitions()`, `Service.Close()`, and
     the sugar `Main` / `Serve` / `ClientFromEnv` / `RunConfig` (serve.go);
@@ -69,9 +74,10 @@ quickjs-worker-go/          project root — run all `go` commands here
 ## Build / test / run
 
 ```bash
-go build ./...                                  # builds agent + the example
+go build ./...                                  # builds agent + both examples
 go test ./...                                   # agent package tests (engine/sandbox/loop/determinism/parallel/race/sessions)
-OPENAI_API_KEY=sk-...  go run ./examples/orchestrator  # serves the "Agent" Virtual Object on :9080 + the back-office services + discovery
+OPENAI_API_KEY=sk-...  go run ./examples/orchestrator  # the "Agent" Virtual Object on :9080
+                       go run ./examples/backoffice    # the discovered handlers on :9081
 ```
 There's also a `Makefile` (`make help` lists targets: build/test/vet/fmt/tidy/run/guest-rs).
 `agent/quickjs_guest.wasm` is a COMMITTED prebuilt artifact (so `go build` needs
@@ -83,15 +89,19 @@ Chat Completions, no special params), `OPENAI_API_KEY` (REQUIRED —
 `ClientFromEnv` fails at boot if unset; use `dummy` for a keyless local endpoint),
 `OPENAI_BASE_URL` (optional; point at any OpenAI-compatible endpoint). The
 orchestrator also reads `RESTATE_ADMIN_URL` (default `http://localhost:9070`) for
-handler discovery.
+handler discovery; the back-office reads `BACKOFFICE_ADDR` (default `:9081`).
 
 ### Run end-to-end against a real Restate runtime (Docker)
 ```bash
 OPENAI_API_KEY=sk-... go run ./examples/orchestrator &       # agent on :9080
+                      go run ./examples/backoffice &         # back-office on :9081
 docker run -d --name restate -p 8080:8080 -p 9070:9070 \
   --add-host=host.docker.internal:host-gateway restatedev/restate:latest
+# register BOTH deployments so the agent discovers the back-office:
 curl -X POST http://localhost:9070/deployments \
   -H content-type:application/json -d '{"uri":"http://host.docker.internal:9080"}'
+curl -X POST http://localhost:9070/deployments \
+  -H content-type:application/json -d '{"uri":"http://host.docker.internal:9081"}'
 # talk to a session (object key = session id):
 curl http://localhost:8080/Agent/s1/Ask -H content-type:application/json -d '{"message":"fulfill order #42: 3x SKU-1, 1x SKU-9, total $1200"}'
 curl -X POST http://localhost:8080/Agent/s1/History   # transcript (empty body — Void input)
@@ -191,9 +201,11 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
   entry points: `DiscoverTools(ctx, cfg)` fetches once at STARTUP (for already-registered
   services); `Config.Discover` discovers lazily **per Ask** and JOURNALS the descriptors
   (via a named `restate.Run`), so the tool set — and thus the system prompt and dispatch
-  table — is identical across replays (use this when the target services co-deploy with
-  the agent and aren't visible until after startup). The annotation value, if non-empty,
-  becomes the tool name (sanitized to a JS identifier).
+  table — is identical across replays. Prefer `Config.Discover` (the orchestrator example
+  uses it) when the target services register independently of the agent — a separate
+  deployment, or one co-deployed but not visible until after startup — since it is
+  order-independent and picks up services registered between turns. The annotation value,
+  if non-empty, becomes the tool name (sanitized to a JS identifier).
 - **Named signals (`AgentSignals`):** `agent.Signal[R](ctx, name)` blocks a leaf tool on
   a named signal on the current invocation. The framework binds a keyless `AgentSignals`
   service whose `resolve` / `reject` handlers complete a signal by `(invocation, name)`;
@@ -317,7 +329,7 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
 - **Graceful shutdown:** `Engine.Close` stops accepting new Runs and waits (bounded by
   ctx) for in-flight Runs before closing the runtime, so it can't close an instance
   under an active guest call (`TestGracefulShutdownWaitsForInflight`).
-- **Demo tools are illustrative:** the orchestrator's `Inventory`/`RiskCheck`/`Payments`
+- **Demo tools are illustrative:** the back-office's `Inventory`/`RiskCheck`/`Payments`
   use toy heuristics (seed 100 stock/SKU, flag orders ≥ $1000) — replace with real
   capabilities.
 - **Committed on `main`.**

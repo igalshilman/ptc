@@ -10,8 +10,8 @@ import (
 )
 
 // The two Restate PRIMITIVES that aren't just handler calls, exposed as static tools
-// alongside the handlers the agent auto-discovers from the Admin API (see main.go /
-// services.go):
+// alongside the handlers the agent auto-discovers from the Admin API (see main.go, and
+// the separate ./examples/backoffice deployment):
 //
 //   - sleep   → a LEAF tool (durable timer): one non-blocking submission returning a
 //               durable Future the batch awaits.
@@ -21,9 +21,10 @@ import (
 //               is recreated at the same journal position → same name → reads its
 //               resolution from the journal).
 //
-// Resolving/rejecting a signal by (invocation, name) are ordinary Restate handlers now
-// (the Signals service in services.go), discovered as tools rather than defined here —
-// so this example defines no multi-step tools at all.
+// Resolving/rejecting a signal by (invocation, name) are ordinary Restate handlers on
+// the framework's own AgentSignals service (bound by the agent; see agent/service.go),
+// discovered as tools rather than defined here — so this example defines no multi-step
+// tools at all.
 
 // ---- sleep (leaf: durable timer) --------------------------------------------
 

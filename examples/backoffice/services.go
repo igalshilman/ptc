@@ -8,20 +8,20 @@ import (
 	"restatedev/agent"
 )
 
-// A small order-fulfillment back-office, co-deployed with the agent. Each handler is
-// ANNOTATED with restate.WithMetadata(agent.AgentToolAnnotation, "<toolName>") — that
-// opt-in marker is what discovery filters on — so the agent discovers them as tools
-// (by the annotated name) and orchestrates them via generated code, in parallel and
-// durably, with no manual wiring:
+// A small order-fulfillment back-office, deployed on its OWN (see main.go). Each handler
+// is ANNOTATED with restate.WithMetadata(agent.AgentToolAnnotation, "<toolName>") — that
+// opt-in marker is what discovery filters on — so the orchestrator agent (a separate
+// deployment) discovers them as tools (by the annotated name) and orchestrates them via
+// generated code, in parallel and durably, with no manual wiring:
 //
 //   - Inventory (keyed Virtual Object)  reserve_stock   — reserve units of a SKU
 //   - RiskCheck (Service)               risk_score      — score an order for review
 //   - Payments  (Service)               charge_payment  — charge a customer
 //
 // The signal-completion tools (resolve/reject) are NOT defined here — they're handlers
-// on the framework's own AgentSignals service (see agent/service.go), discovered the same
-// way. In real use you'd annotate handlers across your own services and point the agent
-// at them; these keep the demo self-contained.
+// on the framework's own AgentSignals service (bound by the agent deployment; see
+// agent/service.go), discovered the same way. In real use you'd annotate handlers across
+// your own services and point the agent at them; these keep the demo self-contained.
 
 // ---- Inventory: keyed Virtual Object, one stock count per SKU ---------------
 

@@ -76,20 +76,27 @@ The handler runs in its own invocation, where it may block/branch freely; to the
 driver the call is just another service-call future. See [`DESIGN.md`](./DESIGN.md) for
 why.
 
-## Example
+## Examples
 
-`examples/orchestrator` is a runnable demo — a tiny `main()` that hands a tool set to
-`agent.Main`. It's an **order-fulfillment agent**: it discovers back-office handlers
-(`Inventory` / `RiskCheck` / `Payments`) via the Restate Admin API and adds two static
-tools — `sleep` (a durable timer) and `signal` (a named-signal human-approval step
-completed by an external caller).
+Two runnable demos under `examples/`, meant to run as two separate Restate deployments:
+
+- **`orchestrator`** — the **order-fulfillment agent** (a tiny `main()` that hands a tool
+  set to `agent.Main`). It discovers back-office handlers via the Restate Admin API and
+  adds two static tools — `sleep` (a durable timer) and `signal` (a named-signal
+  human-approval step completed by an external caller).
+- **`backoffice`** — a standalone Restate deployment of the handlers the agent drives:
+  `Inventory` / `RiskCheck` / `Payments`, each annotated with `AgentToolAnnotation` so
+  discovery turns it into a tool. It knows nothing about the agent — it's just an
+  ordinary service deployment, which is the point: register both with Restate and the
+  agent discovers it across the Admin API.
 
 ## Run
 
 ```bash
-go build ./...                                          # builds the engine + the example
+go build ./...                                          # builds the engine + both examples
 go test ./...                                           # engine, sandbox, loop, determinism, pooling, sessions
-OPENAI_API_KEY=sk-...  go run ./examples/orchestrator   # serves the Agent Virtual Object on :9080
+OPENAI_API_KEY=sk-...  go run ./examples/orchestrator   # the agent, on :9080
+                       go run ./examples/backoffice     # the discovered handlers, on :9081
 ```
 
 A [Nix](https://nixos.org) dev shell with the full toolchain (Go, plus Rust with the
@@ -99,16 +106,21 @@ via `flake.lock`).
 Env: `OPENAI_API_KEY` (required — boot fails if unset; use `dummy` for a keyless local
 endpoint), `AGENT_MODEL` (default `gpt-5`), `AGENT_ADDR` (default `:9080`),
 `OPENAI_BASE_URL` (any OpenAI-compatible endpoint). The orchestrator also reads
-`RESTATE_ADMIN_URL` (default `http://localhost:9070`) for handler discovery.
+`RESTATE_ADMIN_URL` (default `http://localhost:9070`) for handler discovery; the
+back-office reads `BACKOFFICE_ADDR` (default `:9081`).
 
 ### Against a real Restate runtime
 
 ```bash
 OPENAI_API_KEY=sk-... go run ./examples/orchestrator &        # agent on :9080
+                      go run ./examples/backoffice &          # back-office on :9081
 docker run -d --name restate -p 8080:8080 -p 9070:9070 \
   --add-host=host.docker.internal:host-gateway restatedev/restate:latest
+# register BOTH deployments so the agent can discover the back-office:
 curl -X POST http://localhost:9070/deployments \
   -H content-type:application/json -d '{"uri":"http://host.docker.internal:9080"}'
+curl -X POST http://localhost:9070/deployments \
+  -H content-type:application/json -d '{"uri":"http://host.docker.internal:9081"}'
 # talk to a session (object key = session id):
 curl http://localhost:8080/Agent/s1/Ask -H content-type:application/json \
   -d '{"message":"fulfill order #42: 3x SKU-1, 1x SKU-9, total $1200"}'
