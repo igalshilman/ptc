@@ -123,16 +123,86 @@ via `//go:embed` as a **committed** artifact (`agent/quickjs_guest.wasm`, ~600 K
 `go build` needs only the Go toolchain. Rebuild it with `make guest-rs` after editing
 `guest-rs/`.
 
-It is a **live coroutine** with NO host import: it exports `start(script)` /
-`resolve(handle, json)` / `reject(handle, msg)` (plus `guest_alloc` / `guest_dealloc`),
-each returning a packed step blob `{s:0 answer | s:1 ops | s:2 error}`. `start` runs the
-program to synchronous quiescence; the JS `__hostCall` bridge gives each tool call a
-deterministic handle, stashes its promise resolvers, and records the op — the host then
-submits those ops as durable futures, races them, and settles the first completion back
-into the guest, which resumes the program to the next quiescence. A persistent
-`thread_local` QuickJS runtime holds one program's state and is dropped/recreated on the
-next `start`. QuickJS is built with `NDEBUG` so its teardown sweep doesn't trip a debug
-refcount assert.
+### The host ↔ guest ↔ JS protocol
+
+Three parties cooperate to run one program:
+
+- the **Go host** (`agent/engine.go` `RunLive`, `agent/guest.go`) — owns durability;
+- the **WASM guest** (`guest-rs/`, Rust/rquickjs) — owns the JS runtime;
+- the **JS bridge** (`agent/sandbox.go`) — injected JS that turns tool calls into an
+  outbox the host drains.
+
+There is **no wasm import**: the guest never calls back into the host. All communication
+is the host calling guest exports and reading a **step blob** each one returns.
+
+**The exports (`guest-rs/src/abi.rs`).** The only `extern` surface:
+
+| export | purpose |
+|---|---|
+| `guest_alloc(size) -> ptr` / `guest_dealloc(ptr, size)` | host writes inputs / frees outputs in linear memory |
+| `start(scriptPtr, scriptLen) -> u64` | begin a program; return the first step |
+| `resolve(handle, valuePtr, valueLen) -> u64` | settle promise `handle` with a JSON value; return the next step |
+| `reject(handle, msgPtr, msgLen) -> u64` | reject promise `handle` with an error message; return the next step |
+
+`start` / `resolve` / `reject` each return a `u64` that packs the result location as
+`(ptr << 32) | len`. The host reads those `len` bytes of JSON (`guest.readBlob`), copies
+them out, and `guest_dealloc`s the buffer. The blob is always one of three shapes (the
+`s` discriminant matches `outDone`/`outCalls`/`outError` in `engine.go`):
+
+| blob | meaning |
+|---|---|
+| `{"s":0,"r":<value>}` | program **returned** `<value>` — done |
+| `{"s":1,"ops":[{handle,name,arg},…]}` | program is **still running**; these are the new tool calls it made this step |
+| `{"s":2,"error":"…"}` | program **threw** (or a syntax/eval error) |
+
+**The assembled script.** For each program the host concatenates (in `Sandbox.RunProgram`):
+a **determinism prelude** (freezes `Math.random`, the `Date` constructor/`Date.now`,
+`crypto`, `performance.now` to this program's seeded values) + the **tool bridge** + the
+model's **program**, wrapped in an async IIFE whose `.then/.catch` stores the final
+`{s:0,r}` / `{s:2,error}` into `globalThis.__output`.
+
+**The JS bridge (`bridgeJS`).** Each registered tool name becomes a plain async function
+`name(arg) → __hostCall(name, arg)`. `__hostCall`:
+
+1. mints a deterministic integer `handle` (a per-program counter starting at 0),
+2. creates a `Promise` and stashes its `{resolve, reject}` in `globalThis.__pending[handle]`,
+3. pushes `{handle, name, arg}` onto `globalThis.__outbox`,
+4. returns the promise.
+
+So JS control flow (`await`, `Promise.all`, `Promise.race`) works normally; the only
+side effect of "calling a tool" is an entry in the outbox.
+
+**The step loop.** `start` evaluates the script and runs the microtask queue to
+**synchronous quiescence** — every promise that *can* settle without the host has. The
+guest then reads a step: if the wrapper already stored `__output`, that's `{s:0}`/`{s:2}`;
+otherwise it drains `__outbox` and returns `{s:1, ops}` (clearing the outbox, so each step
+carries only the ops emitted *since the last one*). The host loop then:
+
+```
+out = start(script)                         → {s:1, ops:[a,b]}   (e.g. a Promise.all)
+  RunLive:
+    inv.Start(ops)     submit a,b as durable Restate futures (journal slots reserved)
+    res = inv.Next()   restate.WaitFirst → FIRST of a,b to settle wins
+    out = resolve(res.handle, res.value)    (or reject) → drive to quiescence → next step
+  … repeat: each step settles exactly ONE promise, in completion order …
+out = resolve(...)                          → {s:0, r}            → RunProgram returns r
+```
+
+Settling **one promise per step, in completion order** is what makes `Promise.race`,
+`Promise.any`, and timeouts work (the losers stay pending). A `Promise.all` still runs in
+parallel because *all* of a step's ops are submitted — their journal slots reserved —
+before any is awaited. The `handle → {resolve, reject}` map and the deterministic handle
+counter are what let the host address "that specific promise" across the boundary.
+
+**State & determinism.** A persistent `thread_local` QuickJS runtime holds one program's
+state across the `start → resolve/reject → …` sequence, and is dropped/recreated on the
+next `start` (instances are pooled and checked out exclusively, so only one program is
+ever live per instance). On a Restate replay the host re-runs `start` from the top and
+feeds the journaled completions back in the same `WaitFirst` order; because the clock,
+randomness, and handle counter are all frozen/deterministic, the program re-derives the
+identical op sequence. QuickJS is built with `NDEBUG` so its teardown sweep doesn't trip a
+debug refcount assert, and the guest drains throwing microtasks fully (leaking a phantom
+`JobException` ref) to avoid an unbalanced `JS_FreeContext`.
 
 ## Durability, determinism, safety
 
