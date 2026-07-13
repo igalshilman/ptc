@@ -210,9 +210,11 @@ counter are what let the host address "that specific promise" across the boundar
 state across the `start → resolve/reject → …` sequence, and is dropped/recreated on the
 next `start` (instances are pooled and checked out exclusively, so only one program is
 ever live per instance). On a Restate replay the host re-runs `start` from the top and
-feeds the journaled completions back in the same `WaitFirst` order; because the clock,
-randomness, and handle counter are all frozen/deterministic, the program re-derives the
-identical op sequence. QuickJS is built with `NDEBUG` so its teardown sweep doesn't trip a
+feeds the journaled completions back in `WaitFirst` order; because the clock, randomness,
+and handle counter are all frozen/deterministic, the program re-derives the same op
+sequence. (One caveat: the *winner* of a `Promise.race` over futures that complete at the
+same instant may not be replay-stable — an SDK-level tie-break issue documented under
+"Known limitation" in [`DESIGN.md`](./DESIGN.md).) QuickJS is built with `NDEBUG` so its teardown sweep doesn't trip a
 debug refcount assert, and the guest drains throwing microtasks fully (leaking a phantom
 `JobException` ref) to avoid an unbalanced `JS_FreeContext`.
 
@@ -220,8 +222,9 @@ debug refcount assert, and the guest drains throwing microtasks fully (leaking a
 
 - **Replay:** on crash/replay the handler re-runs the Go loop from the top; each
   journaled model call and tool call returns its captured value instead of re-executing,
-  and the host feeds the completions back in the same `WaitFirst` order — so the program
-  re-derives identically. Deterministic give-ups (`ErrMaxRounds`) are surfaced as
+  and the host feeds the completions back through `WaitFirst` — so the program re-derives
+  identically (with the one `Promise.race` tie-break caveat noted above). Deterministic
+  give-ups (`ErrMaxRounds`) are surfaced as
   *terminal* errors so Restate never retries them forever; session state is persisted
   only on success.
 - **Determinism:** `guest.start` re-runs the program verbatim, so its clock and

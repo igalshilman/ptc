@@ -3,8 +3,52 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 )
+
+// reservedJSNames are globals the determinism prelude, tool bridge, and result wrapper
+// install or depend on (see detPreludeJS / bridgeJS / wrapperPostJS). A tool named any
+// of these would shadow them when the bridge installs it on globalThis — e.g. a tool
+// named JSON breaks result parsing/serialization, one named Promise breaks the bridge's
+// promise creation. Names beginning with "__" are reserved wholesale for bridge
+// internals (__hostCall, __pending, __outbox, __resolveJSON, __reject, __output, …).
+// These are exactly the bare globals the injected JS (detPreludeJS / bridgeJS /
+// wrapperPostJS) references: JSON/String (result serialization + error stringify),
+// Promise (bridge), Error (__reject), Date/Math/crypto/performance (determinism prelude),
+// globalThis, and the bridge's own `tools` object. Keep this in sync if the injected JS
+// starts depending on another global.
+var reservedJSNames = map[string]bool{
+	"JSON": true, "String": true, "Promise": true, "Date": true, "Math": true,
+	"crypto": true, "performance": true, "Error": true, "globalThis": true, "tools": true,
+}
+
+// validToolName reports whether name is safe to expose as a JS tool: a non-empty JS
+// identifier, not in the "__" bridge-internal namespace, and not a reserved global the
+// sandbox machinery depends on. Discovered names are already run through sanitizeName
+// (so they are identifier-shaped), but static tool names are developer-supplied and
+// unchecked, and sanitizeName can still yield "" or a reserved word.
+func validToolName(name string) error {
+	if name == "" {
+		return errors.New("empty tool name")
+	}
+	for i, r := range name {
+		ok := r == '_' || r == '$' ||
+			(r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(i > 0 && r >= '0' && r <= '9')
+		if !ok {
+			return fmt.Errorf("%q is not a valid JS identifier (bad char %q)", name, r)
+		}
+	}
+	if strings.HasPrefix(name, "__") {
+		return fmt.Errorf("%q: names beginning with __ are reserved for the bridge", name)
+	}
+	if reservedJSNames[name] {
+		return fmt.Errorf("%q is a reserved JS global name", name)
+	}
+	return nil
+}
 
 // ToolSpec describes a tool to the model: its name, a human description, and the
 // JSON Schemas for its single argument object (Params) and its return value
@@ -157,13 +201,40 @@ const bridgeJS = `;(function () {
 })();
 `
 
-// The program is wrapped in an async IIFE; on settle it publishes the output blob
-// the guest reads — its return value ({s:0}) or a thrown error ({s:2}).
+// The program is wrapped in an async IIFE; on settle it publishes the output blob the
+// guest reads — its return value ({s:0}) or a program error ({s:2}).
+//
+// BOTH handlers set globalThis.__output UNCONDITIONALLY. The success path's JSON.stringify
+// can itself throw (a BigInt, a circular object, a throwing toJSON) inside the fulfillment
+// handler, where the rejection handler cannot see it; and building the error message from
+// the thrown value can ALSO throw (an exotic value: a null-proto object, a throwing
+// `message` getter, a throwing toString). If __output were left unset the guest would
+// report a running-but-idle step, which the host misreads as a deadlock (a misleading
+// terminal "no progress" error). So the message is extracted under its own try/catch with
+// a constant fallback, and the assignment has a final constant-string fallback that cannot
+// throw — __output is always set. This keeps a returned-but-unserializable value symmetric
+// with a thrown one: both come back as a NON-terminal program error the agent loop feeds to
+// the model to self-correct. (The wrapper runs after tools are installed, so it relies on
+// JSON/String not being shadowed — validToolName reserves those names; see reservedJSNames.)
 const (
 	wrapperPreJS  = ";(async function () {\n"
-	wrapperPostJS = "\n})().then(" +
-		"function (r) { globalThis.__output = JSON.stringify({ s: 0, r: r === undefined ? null : r }); }, " +
-		"function (e) { globalThis.__output = JSON.stringify({ s: 2, error: (e && e.message !== undefined) ? String(e.message) : String(e) }); });\n"
+	wrapperPostJS = `
+})().then(
+  function (r) {
+    try { globalThis.__output = JSON.stringify({ s: 0, r: r === undefined ? null : r }); }
+    catch (e) {
+      var m; try { m = String(e && e.message !== undefined ? e.message : e); } catch (e2) { m = "unstringifiable value"; }
+      try { globalThis.__output = JSON.stringify({ s: 2, error: "return value is not JSON-serializable: " + m }); }
+      catch (e3) { globalThis.__output = '{"s":2,"error":"return value is not JSON-serializable"}'; }
+    }
+  },
+  function (e) {
+    var m; try { m = String(e && e.message !== undefined ? e.message : e); } catch (e2) { m = "unstringifiable value"; }
+    try { globalThis.__output = JSON.stringify({ s: 2, error: m }); }
+    catch (e3) { globalThis.__output = '{"s":2,"error":"program threw a non-stringifiable value"}'; }
+  }
+);
+`
 )
 
 // determinismPrelude fills detPreludeJS with this run's seed and frozen clock.

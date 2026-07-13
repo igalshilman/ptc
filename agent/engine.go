@@ -169,9 +169,13 @@ func NewEngine(ctx context.Context, wasm []byte) (*Engine, error) {
 	}, nil
 }
 
-// Close stops accepting new Runs, waits (bounded by ctx) for in-flight Runs so
+// Close stops accepting new Runs and waits (bounded by ctx) for in-flight Runs so
 // runtime.Close can't close an instance under an active guest call, then drains the
-// pool and releases the runtime.
+// pool and releases the runtime. If ctx expires while a Run is still in flight, Close
+// returns ctx.Err() WITHOUT closing the runtime (closing it would pull an instance out
+// from under the active guest call) and leaves the engine in the closing state; call
+// Close again with a fresh context to finish shutting down. So a caller that passes a
+// deadline must be prepared to retry — otherwise the runtime and pooled instances leak.
 func (e *Engine) Close(ctx context.Context) error {
 	e.mu.Lock()
 	e.closing = true
@@ -182,6 +186,9 @@ func (e *Engine) Close(ctx context.Context) error {
 	select {
 	case <-drained:
 	case <-ctx.Done():
+		// New Runs are already rejected (enter() checks e.closing); a later Close with
+		// a live context can finish once the in-flight Runs complete.
+		return ctx.Err()
 	}
 
 	for {

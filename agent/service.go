@@ -56,6 +56,12 @@ func NewService(ctx context.Context, cfg Config) (*Service, error) {
 	if rounds == 0 {
 		rounds = 10
 	}
+	// Fail fast on a bad static tool set (empty/duplicate/reserved/non-JS-safe names)
+	// rather than surfacing it as a terminal error on the first Ask.
+	if _, err := resolveToolSet(cfg.Tools, nil, func(string, ...any) {}); err != nil {
+		_ = eng.Close(ctx)
+		return nil, err
+	}
 	return &Service{
 		engine:    eng,
 		client:    cfg.Client,
@@ -158,10 +164,12 @@ func (s *Service) Ask(ctx restate.ObjectContext, in AskInput) (AskOutput, error)
 	}
 	convo := &Conversation{Turns: append(history, Turn{Role: RoleUser, Content: in.Message})}
 
+	logf := func(f string, a ...any) { ctx.Log().Info(fmt.Sprintf(f, a...)) }
+
 	// Resolve this turn's tool set: the static tools plus, if configured, handlers
 	// discovered from the Admin API. Discovery is a JOURNALED step, so the tool set —
 	// and thus the system prompt and the dispatch table — is identical across replays.
-	tools := s.tools
+	var discoveredTools []Tool
 	if s.discover != nil {
 		discovered, derr := restate.Run(ctx, func(rc restate.RunContext) ([]handlerDescriptor, error) {
 			return fetchHandlers(rc, *s.discover)
@@ -169,11 +177,17 @@ func (s *Service) Ask(ctx restate.ObjectContext, in AskInput) (AskOutput, error)
 		if derr != nil {
 			return AskOutput{}, derr
 		}
-		tools = make([]Tool, 0, len(s.tools)+len(discovered))
-		tools = append(tools, s.tools...)
+		discoveredTools = make([]Tool, 0, len(discovered))
 		for _, d := range discovered {
-			tools = append(tools, toolFromDescriptor(d))
+			discoveredTools = append(discoveredTools, toolFromDescriptor(d))
 		}
+	}
+	// Validate + merge. A bad STATIC tool is a terminal config error; a bad or colliding
+	// DISCOVERED tool (untrusted annotation metadata) is dropped-and-logged so one bad
+	// co-deployed service can't brick every session. Deterministic → replay-safe.
+	tools, terr := resolveToolSet(s.tools, discoveredTools, logf)
+	if terr != nil {
+		return AskOutput{}, terr
 	}
 
 	inv := &restateInvoker{
@@ -199,9 +213,7 @@ func (s *Service) Ask(ctx restate.ObjectContext, in AskInput) (AskOutput, error)
 
 	model := &openAIModel{rctx: ctx, client: s.client, model: s.model, system: BuildSystemPrompt(toolSpecs(tools))}
 
-	answer, agentErr := RunAgent(ctx, sb, model, convo, s.maxRounds, func(f string, a ...any) {
-		ctx.Log().Info(fmt.Sprintf(f, a...))
-	})
+	answer, agentErr := RunAgent(ctx, sb, model, convo, s.maxRounds, logf)
 	if agentErr != nil {
 		// RunAgent's failures (e.g. ErrMaxRounds) are DETERMINISTIC — replaying
 		// would reproduce them — so surface as terminal to avoid infinite retries.
@@ -228,6 +240,43 @@ func (s *Service) History(ctx restate.ObjectSharedContext, _ restate.Void) ([]Tu
 func (s *Service) Reset(ctx restate.ObjectContext, _ restate.Void) (restate.Void, error) {
 	restate.Clear(ctx, historyKey)
 	return restate.Void{}, nil
+}
+
+// resolveToolSet validates and merges a turn's tools into the final dispatch set.
+// Static tools are developer-owned: any invalid name (empty / reserved / not a JS
+// identifier — see validToolName) or duplicate is a TERMINAL configuration error.
+// Discovered tools come from untrusted Admin-API annotation metadata, so a bad or
+// colliding one is DROPPED and logged rather than failing the turn — otherwise one
+// mis-annotated co-deployed service (e.g. annotated "JSON", or two that sanitize to the
+// same identifier) could brick every session. First-registered wins a name; static
+// tools are considered first. Pure/deterministic (same inputs → same result and same
+// drops), so it is replay-safe.
+func resolveToolSet(static, discovered []Tool, logf func(string, ...any)) ([]Tool, error) {
+	out := make([]Tool, 0, len(static)+len(discovered))
+	seen := make(map[string]bool, len(static)+len(discovered))
+	for _, t := range static {
+		if err := validToolName(t.Name); err != nil {
+			return nil, restate.TerminalErrorf("invalid tool name: %v", err)
+		}
+		if seen[t.Name] {
+			return nil, restate.TerminalErrorf("duplicate tool name %q", t.Name)
+		}
+		seen[t.Name] = true
+		out = append(out, t)
+	}
+	for _, t := range discovered {
+		if err := validToolName(t.Name); err != nil {
+			logf("discovery: dropping tool: %v", err)
+			continue
+		}
+		if seen[t.Name] {
+			logf("discovery: dropping tool %q: name already in use", t.Name)
+			continue
+		}
+		seen[t.Name] = true
+		out = append(out, t)
+	}
+	return out, nil
 }
 
 // --- Invoker: dispatches JS tool calls to the registered Tools ---------------

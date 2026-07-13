@@ -115,10 +115,25 @@ coroutine.
 
 Replay-safe because: `guest.start` re-runs the pure JS program (same ops, same
 deterministic handles on replay); each submission reserves a journal slot in
-deterministic loop order; `WaitFirst` yields completions in journaled order on replay,
-so which op "wins" a race is reproduced. A `Promise.race` loser is simply abandoned —
-its durable future is left in flight (no cleanup, by design), and `Reset` clears the
-host's leftover handle state before the next program.
+deterministic loop order; and settling the winner drives the program identically. A
+`Promise.race` loser is simply abandoned — its durable future is left in flight (no
+cleanup, by design), and `Reset` clears the host's leftover handle state before the next
+program.
+
+> **Known limitation — `Promise.race` winner is not proven replay-stable.** When two or
+> more futures are *already complete at the same `WaitFirst` poll* (which can happen on
+> replay, where the runtime front-loads journaled completions), `restate.WaitFirst` in
+> sdk-go v1.0.0 picks the winner by **Go map-iteration order**
+> (`internal/restatecontext/wait_iterator.go`), not by journaled-completion order — so a
+> replay could resolve a *different* `Promise.race` / `Promise.any` branch than the live
+> run. `Promise.all` is unaffected (order-independent). This lives entirely in the SDK
+> (v1.0.0 is the latest; sorting our `sels` doesn't help — `WaitIter` re-copies into its
+> own map), so it isn't fixable from this module and has no offline test (the state
+> machine is an `internal/` package we can't import). It is most likely **fail-loud** (a
+> divergent replay trips Restate's journal check and errors the invocation) rather than a
+> silent wrong answer. To reproduce: run against a real Restate runtime, drive a
+> `Promise.race` over two near-simultaneous tools, and force a mid-invocation replay. The
+> real fix is a deterministic tie-break upstream in the SDK.
 
 ## Why not the alternatives (considered, rejected)
 
