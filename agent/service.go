@@ -16,7 +16,7 @@ import (
 // Config configures a durable agent Service.
 type Config struct {
 	Client    openai.Client // an OpenAI(-compatible) client
-	Model     string        // model id (default "gpt-4o-mini")
+	Model     string        // model id (default "gpt-5")
 	Tools     []Tool        // developer tools exposed to the agent
 	MaxRounds int           // loop budget per message (default 10)
 	// Discover, if set, makes each Ask discover handler-tools from the Restate Admin
