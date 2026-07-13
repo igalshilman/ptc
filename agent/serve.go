@@ -12,63 +12,11 @@ import (
 	"github.com/restatedev/sdk-go/server"
 )
 
-// serve.go is the convenience entrypoint shared by every example under examples/.
-// It resolves the OpenAI client + model from the environment, wires the Service, and
-// serves it — so an example is just its tool set plus a one-call main(). The pure API
-// (NewService / Definitions / Close) is unchanged and still available for full control
-// (that's what the tests use); Main/Serve are only opinionated sugar on top of it.
-
-// RunConfig configures the Main convenience entrypoint. Only Tools is required; the
-// rest fall back to Config's defaults (see NewService).
-type RunConfig struct {
-	// Tools builds the example's tool set. It receives the OpenAI client and model id
-	// resolved from the environment, so a tool may CAPTURE them — e.g. a tool that makes
-	// its own durable model call. Required unless Discover is set.
-	Tools func(client openai.Client, model string) []Tool
-	// Discover, if set, makes each Ask discover handler-tools from the Restate Admin
-	// API (journaled) and merge them with Tools (see examples/orchestrator). Either
-	// Tools or Discover is required.
-	Discover *DiscoverConfig
-	// MaxRounds is the per-message loop budget (0 → default 10).
-	MaxRounds int
-	// Extra are additional Restate service definitions to bind in the SAME deployment as
-	// the agent (served on AGENT_ADDR). Optional — a discovered handler typically lives in
-	// its own deployment (see examples/backoffice) rather than here.
-	Extra []restate.ServiceDefinition
-}
-
-// Main is the one-call entrypoint for an example binary: it resolves the OpenAI client
-// and model from the environment (see ClientFromEnv), builds the tool set, constructs
-// the Service, binds its Restate services, and serves on AGENT_ADDR (default :9080),
-// blocking until the server stops. Any fatal setup/serve error is logged and exits the
-// process — it is meant for a `package main`, not for embedding (use NewService/Serve
-// directly for that).
-func Main(cfg RunConfig) {
-	if cfg.Tools == nil && cfg.Discover == nil {
-		log.Fatal("agent.Main: RunConfig needs Tools or Discover")
-	}
-	ctx := context.Background()
-	client, model, err := ClientFromEnv()
-	if err != nil {
-		log.Fatalf("agent.Main: %v", err)
-	}
-	var tools []Tool
-	if cfg.Tools != nil {
-		tools = cfg.Tools(client, model)
-	}
-	svc, err := NewService(ctx, Config{
-		Client:    client,
-		Model:     model,
-		Tools:     tools,
-		Discover:  cfg.Discover,
-		MaxRounds: cfg.MaxRounds,
-	})
-	if err != nil {
-		log.Fatalf("agent.Main: build service: %v", err)
-	}
-	defer svc.Close(ctx)
-	Serve(ctx, svc, cfg.Extra...)
-}
+// serve.go holds the two small conveniences an example main() shares on top of the pure
+// API (NewService / Definitions / Close, which is what the tests use): ClientFromEnv
+// resolves the OpenAI client + model from the environment, and Serve binds the Service's
+// Restate definitions and serves them on AGENT_ADDR. An example wires them together
+// itself (see examples/orchestrator) — there is no hidden Main entrypoint.
 
 // ClientFromEnv builds an OpenAI(-compatible) client and resolves the model id from the
 // environment: OPENAI_API_KEY (required — fail fast at boot; use "dummy" for a keyless

@@ -31,24 +31,37 @@
 package main
 
 import (
+	"context"
+	"log"
 	"os"
-
-	"github.com/openai/openai-go/v3"
 
 	"restatedev/agent"
 )
 
 func main() {
-	agent.Main(agent.RunConfig{
+	ctx := context.Background()
+
+	// The OpenAI client + model come from the environment (OPENAI_API_KEY required,
+	// AGENT_MODEL / OPENAI_BASE_URL optional).
+	client, model, err := agent.ClientFromEnv()
+	if err != nil {
+		log.Fatalf("orchestrator: %v", err)
+	}
+
+	svc, err := agent.NewService(ctx, agent.Config{
+		Client: client,
+		Model:  model,
+		// The two primitives that aren't just handler calls (durable timer + named signal).
+		Tools: []agent.Tool{sleepTool(), signalTool()},
 		// Discover annotated handlers (the back-office deployment + the framework's
 		// AgentSignals service) from the Admin API, lazily, per Ask.
 		Discover: &agent.DiscoverConfig{AdminURL: os.Getenv("RESTATE_ADMIN_URL")},
-		// The two primitives that aren't just handler calls (durable timer + named signal).
-		Tools: func(_ openai.Client, _ string) []agent.Tool {
-			return []agent.Tool{
-				sleepTool(),
-				signalTool(),
-			}
-		},
 	})
+	if err != nil {
+		log.Fatalf("orchestrator: build service: %v", err)
+	}
+	defer svc.Close(ctx)
+
+	// Bind the agent's Restate definitions and serve on AGENT_ADDR (default :9080).
+	agent.Serve(ctx, svc)
 }

@@ -80,10 +80,10 @@ why.
 
 Two runnable demos under `examples/`, meant to run as two separate Restate deployments:
 
-- **`orchestrator`** — the **order-fulfillment agent** (a tiny `main()` that hands a tool
-  set to `agent.Main`). It discovers back-office handlers via the Restate Admin API and
-  adds two static tools — `sleep` (a durable timer) and `signal` (a named-signal
-  human-approval step completed by an external caller).
+- **`orchestrator`** — the **order-fulfillment agent** (a tiny `main()` that builds a tool
+  set and wires it via `agent.NewService` / `agent.Serve`). It discovers back-office
+  handlers via the Restate Admin API and adds two static tools — `sleep` (a durable timer)
+  and `signal` (a named-signal human-approval step completed by an external caller).
 - **`backoffice`** — a standalone Restate deployment of the handlers the agent drives:
   `Inventory` / `RiskCheck` / `Payments`, each annotated with `AgentToolAnnotation` so
   discovery turns it into a tool. It knows nothing about the agent — it's just an

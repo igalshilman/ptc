@@ -24,7 +24,7 @@ quickjs-worker-go/          project root — run all `go` commands here
 ├── examples/               runnable demo binaries (USER code) — each is a package main,
 │   │                        meant to run as SEPARATE Restate deployments
 │   ├── orchestrator/        an order-fulfillment agent that discovers back-office handlers
-│   │   ├── main.go           agent.Main{Discover + static tools}
+│   │   ├── main.go           ClientFromEnv → NewService{Discover + static tools} → Serve
 │   │   └── tools.go          the `sleep` (Timer) and `signal` (named-signal approval) tools
 │   └── backoffice/          standalone deployment of the handlers the agent discovers
 │       ├── main.go           binds the services on :9081 (plain restate server, no agent)
@@ -38,7 +38,7 @@ quickjs-worker-go/          project root — run all `go` commands here
 │   ├── tool.go              Tool, NewTool (leaf→Future); Future[R] + Run/Call/CallObject/Timer/Awakeable/Signal helpers; reflected arg+result schemas
 │   ├── discover.go          Admin-API handler discovery: DiscoverConfig, AgentToolAnnotation, DiscoverTools, toolFromDescriptor
 │   ├── service.go           Config, Service, NewService, Definitions; Ask/History/Reset; AgentSignals resolve/reject; restateInvoker (Start/Next, WaitFirst driver); openAIModel
-│   ├── serve.go             convenience entrypoint for the example: Main / Serve / ClientFromEnv / RunConfig
+│   ├── serve.go             shared example conveniences: ClientFromEnv (env→client) + Serve (bind+listen)
 │   ├── quickjs_guest.wasm   the embedded guest (~600 KB, built from guest-rs/)
 │   ├── agent_test.go        in-package tests + test doubles (~30 tests)
 │   └── bench_test.go        instantiate/round/parallel benchmarks (the pool-decision evidence)
@@ -48,11 +48,11 @@ quickjs-worker-go/          project root — run all `go` commands here
 - **Entry commands:** `go run ./examples/orchestrator` (the agent) and, as a separate
   deployment, `go run ./examples/backoffice` (the handlers it discovers) — the module
   root and `agent/` are NOT runnable (no `main`). The orchestrator is a tiny `main()`
-  that hands a tool set to `agent.Main` (in `serve.go`); the back-office is a plain
-  Restate service deployment.
+  that builds a tool set and wires it via `NewService` / `Serve` (see serve.go); the
+  back-office is a plain Restate service deployment.
 - **Public API** the example uses from the `agent` package:
   - lifecycle: `Config`, `NewService`, `Service.Definitions()`, `Service.Close()`, and
-    the sugar `Main` / `Serve` / `ClientFromEnv` / `RunConfig` (serve.go);
+    the example conveniences `ClientFromEnv` / `Serve` (serve.go);
   - tools: `Tool`, `NewTool`, `Future[R]`, and the future helpers `Run` / `Call` /
     `CallObject` / `Timer` / `Awakeable` / `Signal`;
   - discovery: `DiscoverConfig`, `AgentToolAnnotation`, `DiscoverTools`.
