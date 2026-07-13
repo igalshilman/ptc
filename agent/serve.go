@@ -23,8 +23,7 @@ import (
 type RunConfig struct {
 	// Tools builds the example's tool set. It receives the OpenAI client and model id
 	// resolved from the environment, so a tool may CAPTURE them — e.g. a tool that makes
-	// its own durable model call (see examples/research's research_topic). Required
-	// unless Discover is set.
+	// its own durable model call. Required unless Discover is set.
 	Tools func(client openai.Client, model string) []Tool
 	// Discover, if set, makes each Ask discover handler-tools from the Restate Admin
 	// API (journaled) and merge them with Tools (see examples/orchestrator). Either
@@ -32,8 +31,8 @@ type RunConfig struct {
 	Discover *DiscoverConfig
 	// MaxRounds is the per-message loop budget (0 → default 10).
 	MaxRounds int
-	// Extra are additional Restate services to bind alongside the agent — e.g. a
-	// service the `rpc` tool can call (see examples/primitives). Optional.
+	// Extra are additional Restate services to bind alongside the agent — e.g. the
+	// back-office handlers the orchestrator example discovers and calls. Optional.
 	Extra []restate.ServiceDefinition
 }
 

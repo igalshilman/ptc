@@ -63,21 +63,14 @@ const (
 	outError = 2 // program error (throw): "error" holds the message
 )
 
-// guestStep is the JSON blob each guest export (start/resolve/reject) returns.
+// guestStep is the JSON blob each guest export (start/resolve/reject) returns. Ops
+// unmarshals straight into []ToolCall (the type Invoker.Start consumes), so there is
+// no separate wire type to convert.
 type guestStep struct {
 	S     int             `json:"s"`
 	R     json.RawMessage `json:"r"`
-	Ops   []guestOp       `json:"ops"`
+	Ops   []ToolCall      `json:"ops"`
 	Error string          `json:"error"`
-}
-
-// guestOp is one operation the program started this step: a stable, deterministic
-// handle plus the tool name and argument. The host settles the promise for `handle`
-// once the corresponding durable future completes.
-type guestOp struct {
-	Handle int             `json:"handle"`
-	Name   string          `json:"name"`
-	Arg    json.RawMessage `json:"arg"`
 }
 
 // maxProgramSteps bounds the drive loop. In the live model each step settles ONE
@@ -88,12 +81,6 @@ type guestOp struct {
 // wall-clock time inside a guest call; WithCloseOnContextDone only lets an invocation
 // cancellation interrupt a stuck guest.
 const maxProgramSteps = 65536
-
-// fatalError signals that execution must ABORT with this error rather than be fed
-// back to the model. The resolve callback panics with it on invocation-fatal
-// conditions (e.g. a Restate cancellation); Engine.Run's recover surfaces err
-// verbatim so its terminal-ness reaches the Ask handler.
-type fatalError struct{ err error }
 
 // Engine holds the one-time wazero setup (runtime + compiled guest) and a pool of
 // reusable instances. The guest is stateless, so a pooled instance needs no reset
@@ -228,7 +215,10 @@ func (e *Engine) release(ctx context.Context, g *guest, healthy bool) {
 // repeatedly submit the ops it emits (inv.Start), race them for the first completion
 // (inv.Next), and settle that promise in the guest (resolve/reject) to get the next
 // step. It returns the program's answer (JSON), or a program error to feed back to
-// the model. A guest trap or Restate cancellation is recovered here.
+// the model. A guest trap or Restate cancellation is NOT recovered here: it panics
+// out to the SDK handler (see "one should not catch panics") so a cancellation can't
+// be demoted to a swallowable per-tool failure. The deferred release still runs during
+// the unwind, and since healthy is never set on that path the instance is retired.
 func (e *Engine) RunLive(ctx context.Context, script string, inv Invoker) (result string, err error) {
 	if !e.enter() {
 		return "", errEngineClosed
@@ -242,21 +232,10 @@ func (e *Engine) RunLive(ctx context.Context, script string, inv Invoker) (resul
 	g.runs++
 	healthy := false
 	defer func() {
-		// if r := recover(); r != nil {
-		// 	result = ""
-		// 	switch v := r.(type) {
-		// 	case fatalError:
-		// 		err = v.err
-		// 	default:
-		// 		if ce := ctx.Err(); ce != nil {
-		// 			err = fmt.Errorf("program interrupted: %w", ce)
-		// 		} else {
-		// 			err = fmt.Errorf("guest execution failed: %v", r)
-		// 		}
-		// 	}
-		// }
-		// Reuse the instance unless a trap fired (recovered above, so healthy is still
-		// false). A fresh `start` resets the guest state, so a mere program error is fine.
+		// Reuse the instance only if a step completed cleanly (healthy). On a trap/
+		// cancellation the guest call panics past every healthy=true, so this runs with
+		// healthy=false during the unwind and the instance is retired, not pooled. A
+		// fresh `start` resets guest state, so a mere program error is fine to reuse.
 		e.release(ctx, g, healthy && ctx.Err() == nil)
 	}()
 
@@ -280,24 +259,14 @@ func (e *Engine) RunLive(ctx context.Context, script string, inv Invoker) (resul
 			return "", fmt.Errorf("js error: %s", step.Error)
 		case outCalls:
 			if len(step.Ops) > 0 {
-				calls := make([]ToolCall, len(step.Ops))
-				for i, o := range step.Ops {
-					calls[i] = ToolCall{Handle: o.Handle, Tool: o.Name, Arg: o.Arg}
-				}
-				inv.Start(calls)
+				inv.Start(step.Ops) // step.Ops is []ToolCall, straight from the guest
 			}
-			if inv.Pending() == 0 {
-				// No new ops and nothing in flight, yet the program hasn't settled — it
-				// awaited something that can never complete (a JS-level deadlock).
-				healthy = true
-				return "", fmt.Errorf("program made no progress (awaiting with no pending operations)")
-			}
-			res, fatal := inv.Next(ctx)
+			res, fatal := inv.Next()
 			if fatal != nil {
-				panic(fatalError{fatal})
+				return "", fatal
 			}
-			if res.IsErr {
-				out, err = g.reject(ctx, res.Handle, []byte(res.ErrMsg))
+			if res.Err != nil {
+				out, err = g.reject(ctx, res.Handle, []byte(res.Err.Error()))
 			} else {
 				v := res.Value
 				if len(v) == 0 {

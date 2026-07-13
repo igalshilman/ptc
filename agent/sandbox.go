@@ -21,9 +21,10 @@ type ToolSpec struct {
 // handle. Implementations:
 //
 //   - test doubles (agent_test.go): in-memory Go funcs, for the offline tests.
-//   - restateInvoker (service.go): submits each op as a durable Future — leaf tools
-//     in-process, seq tools as their own sub-invocation — and races them with
-//     restate.WaitFirst. Journaled and replay-safe; none of that is visible to the JS.
+//   - restateInvoker (service.go): submits each op as a durable Future and races them
+//     with restate.WaitFirst. Journaled and replay-safe; none of that is visible to
+//     the JS. (A multi-step operation is an ordinary handler a leaf tool Calls, so it
+//     too is just one of these futures.)
 type Invoker interface {
 	// Tools returns the registered tool specs, in a stable order. Names drive the
 	// JS bridge; the full specs (incl. JSON Schema) are surfaced to the model.
@@ -36,12 +37,10 @@ type Invoker interface {
 	// Start submits new ops as in-flight durable operations, keyed by ToolCall.Handle.
 	// Non-blocking.
 	Start(calls []ToolCall)
-	// Next drives the in-flight ops until the FIRST one settles and returns it. A
-	// non-nil error is invocation-FATAL (e.g. a Restate cancellation), not a per-op
-	// failure. Must not be called when Pending() == 0.
-	Next(ctx context.Context) (StepResult, error)
-	// Pending reports how many ops are still in flight (for deadlock detection).
-	Pending() int
+	// Next drives the in-flight ops until the FIRST one settles and returns it (a
+	// StepResult whose Err is set iff that op failed). A non-nil second return is
+	// invocation-FATAL (e.g. a Restate cancellation), distinct from a per-op failure.
+	Next() (StepResult, error)
 }
 
 // Sandbox runs a single JS program with the registered tools exposed as plain async
@@ -188,19 +187,19 @@ func (s *Sandbox) toolBridge() string {
 }
 
 // ToolCall is one operation the program started: a stable, deterministic handle plus
-// the tool name and its JSON argument.
+// the tool name and its JSON argument. It is also the wire shape the guest emits (see
+// guestStep.Ops), so it unmarshals directly from the guest's step blob.
 type ToolCall struct {
-	Handle int
-	Tool   string
-	Arg    json.RawMessage
+	Handle int             `json:"handle"`
+	Tool   string          `json:"name"`
+	Arg    json.RawMessage `json:"arg"`
 }
 
 // StepResult is the settlement of one operation that the Invoker's Next returns: the
-// handle it belongs to and either a JSON value (Value) or an error message (ErrMsg,
-// when IsErr).
+// handle it belongs to and either a JSON value (Value) or, when the op failed, an Err
+// (delivered to JS as a rejected promise).
 type StepResult struct {
 	Handle int
 	Value  json.RawMessage // valid JSON on success (empty → treated as null)
-	ErrMsg string          // set iff IsErr
-	IsErr  bool
+	Err    error           // non-nil iff the op failed
 }

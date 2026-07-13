@@ -31,8 +31,8 @@ fmt: ## Format sources
 tidy: ## Tidy go.mod/go.sum
 	go mod tidy
 
-run: ## Run the research example (needs OPENAI_API_KEY; serves :9080)
-	go run ./examples/research
+run: ## Run the orchestrator example (needs OPENAI_API_KEY; serves :9080)
+	go run ./examples/orchestrator
 
 guest-rs: ## Rebuild $(GUEST_WASM) from guest-rs/ (Rust/rquickjs → wasm32-wasip1)
 	cd guest-rs && cargo build --release --target wasm32-wasip1

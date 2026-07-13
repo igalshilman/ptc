@@ -38,8 +38,9 @@ func newGuest(mod api.Module) *guest {
 }
 
 // call1 invokes a guest export returning a single scalar. A wasm trap panics here
-// and is recovered into an error in Engine.RunLive, rather than threading errors
-// through every call site.
+// (as does a Restate cancellation surfaced by the driver); the panic propagates out
+// of Engine.RunLive to the SDK handler rather than being threaded through every call
+// site — RunLive no longer recovers it (see commit "one should not catch panics").
 func call1(ctx context.Context, fn api.Function, args ...uint64) uint64 {
 	res, err := fn.Call(ctx, args...)
 	if err != nil {

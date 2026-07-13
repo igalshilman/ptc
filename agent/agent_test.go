@@ -240,27 +240,29 @@ func (m *testInvoker) Start(calls []ToolCall) {
 		m.done = map[int]StepResult{}
 	}
 	for _, c := range calls {
-		m.done[c.Handle] = runTestTool(m.tools[c.Tool], c)
+		fn := m.tools[c.Tool]
+		if fn == nil {
+			// Mirror restateInvoker.Start: an unsubmittable op (unknown tool) is fatal
+			// to the whole program, not a per-op rejection.
+			panic(restate.TerminalErrorf("unknown tool %q", c.Tool))
+		}
+		m.done[c.Handle] = runTestTool(fn, c)
 	}
 }
-func (m *testInvoker) Pending() int                             { return len(m.done) }
-func (m *testInvoker) Next(context.Context) (StepResult, error) { return popLowest(m.done), nil }
+func (m *testInvoker) Next() (StepResult, error) { return popLowest(m.done), nil }
 
 // runTestTool executes an in-memory test tool and returns its settled StepResult,
-// mirroring the validation the real invoker's Next does (unknown tool / error /
-// empty → null / invalid JSON → tool-named error).
+// mirroring the validation the real invoker's Next does (tool error / empty → null /
+// invalid JSON → tool-named error). Unknown tools are caught earlier, in Start.
 func runTestTool(fn func(context.Context, json.RawMessage) (json.RawMessage, error), c ToolCall) StepResult {
-	if fn == nil {
-		return StepResult{Handle: c.Handle, ErrMsg: fmt.Sprintf("unknown tool %q", c.Tool), IsErr: true}
-	}
 	v, err := fn(context.Background(), c.Arg)
 	switch {
 	case err != nil:
-		return StepResult{Handle: c.Handle, ErrMsg: err.Error(), IsErr: true}
+		return StepResult{Handle: c.Handle, Err: err}
 	case len(v) == 0:
 		return StepResult{Handle: c.Handle, Value: json.RawMessage("null")}
 	case !json.Valid(v):
-		return StepResult{Handle: c.Handle, ErrMsg: fmt.Sprintf("tool %q returned invalid JSON", c.Tool), IsErr: true}
+		return StepResult{Handle: c.Handle, Err: fmt.Errorf("tool %q returned invalid JSON", c.Tool)}
 	default:
 		return StepResult{Handle: c.Handle, Value: v}
 	}
@@ -560,8 +562,7 @@ func (r *recordingInvoker) Start(calls []ToolCall) {
 	}
 	r.inner.Start(calls)
 }
-func (r *recordingInvoker) Pending() int                                 { return r.inner.Pending() }
-func (r *recordingInvoker) Next(ctx context.Context) (StepResult, error) { return r.inner.Next(ctx) }
+func (r *recordingInvoker) Next() (StepResult, error) { return r.inner.Next() }
 
 // TestReplayDeterminism is the core durability guarantee at the integration
 // level: two independent runs (fresh QuickJS instances — as after a crash+replay)
@@ -654,14 +655,13 @@ func (b *batchMock) Start(calls []ToolCall) {
 	for _, c := range calls {
 		v, err := b.fn(c.Tool, c.Arg)
 		if err != nil {
-			b.done[c.Handle] = StepResult{Handle: c.Handle, ErrMsg: err.Error(), IsErr: true}
+			b.done[c.Handle] = StepResult{Handle: c.Handle, Err: err}
 		} else {
 			b.done[c.Handle] = StepResult{Handle: c.Handle, Value: v}
 		}
 	}
 }
-func (b *batchMock) Pending() int                             { return len(b.done) }
-func (b *batchMock) Next(context.Context) (StepResult, error) { return popLowest(b.done), nil }
+func (b *batchMock) Next() (StepResult, error) { return popLowest(b.done), nil }
 
 // TestBatchInvoker: a Promise.all of N tool calls is delivered to InvokeBatch as ONE
 // frontier of N — the hook a durable invoker uses to run them in parallel

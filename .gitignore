@@ -7,6 +7,9 @@
 # OS / editor cruft
 .DS_Store
 
+# Claude Code local scratch (never commit)
+.claude/
+
 # Rust build artifacts — source (incl. guest-rs/.cargo/config.toml) is committed.
 target/
 Cargo.lock

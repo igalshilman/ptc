@@ -180,7 +180,6 @@ func (s *Service) Ask(ctx restate.ObjectContext, in AskInput) (AskOutput, error)
 		rctx:    ctx,
 		tools:   map[string]Tool{},
 		pending: map[int]pendingOp{},
-		ready:   map[int]readyOp{},
 	}
 	for _, t := range tools {
 		inv.tools[t.Name] = t
@@ -233,27 +232,20 @@ func (s *Service) Reset(ctx restate.ObjectContext, _ restate.Void) (restate.Void
 
 // --- Invoker: dispatches JS tool calls to the registered Tools ---------------
 
-// restateInvoker binds registered tools to the current invocation's context and
-// satisfies Invoker. It tracks in-flight operations by handle across the program's
-// lifetime; the context.Context passed to Next (carrying no useful state) is ignored,
-// the tools get the real restate.Context.
+// restateInvoker binds registered tools to the current invocation's restate.Context
+// and satisfies Invoker. It tracks in-flight operations by handle across the program's
+// lifetime.
 type restateInvoker struct {
 	rctx  restate.Context
 	tools map[string]Tool
 	order []string
 
 	pending map[int]pendingOp // handle -> in-flight durable future
-	ready   map[int]readyOp   // handle -> op that failed at submit time (settles immediately)
 }
 
 type pendingOp struct {
 	fut  anyFuture
 	name string // tool name, for a clear invalid-JSON error
-}
-
-type readyOp struct {
-	err  error
-	name string
 }
 
 func (r *restateInvoker) Tools() []ToolSpec {
@@ -271,82 +263,70 @@ func (r *restateInvoker) Tools() []ToolSpec {
 // are left in flight (no cleanup, by design).
 func (r *restateInvoker) Reset() {
 	r.pending = map[int]pendingOp{}
-	r.ready = map[int]readyOp{}
 }
 
 // Start submits each new op as an in-flight durable Future (Run/Call/CallObject/Timer/
-// Awakeable/Signal), keyed by the op's stable handle. An op that can't even be
-// submitted (unknown tool / bad args) is recorded as immediately-settled. Non-blocking.
+// Awakeable/Signal), keyed by the op's stable handle. Non-blocking. An op that can't
+// even be submitted (unknown tool / bad args) is a FATAL, non-recoverable condition —
+// it panics, aborting the whole program rather than being demoted to a per-op rejection
+// the JS could swallow.
 func (r *restateInvoker) Start(calls []ToolCall) {
 	for _, c := range calls {
 		t, ok := r.tools[c.Tool]
 		if !ok {
-			r.ready[c.Handle] = readyOp{err: restate.TerminalErrorf("unknown tool %q", c.Tool), name: c.Tool}
-			continue
+			panic(restate.TerminalErrorf("unknown tool %q", c.Tool))
 		}
 		f, err := r.submit(t, c) // NON-blocking: reserves a journal slot, returns immediately
 		if err != nil {
-			r.ready[c.Handle] = readyOp{err: err, name: c.Tool}
-			continue
+			panic(err)
 		}
 		r.pending[c.Handle] = pendingOp{fut: f, name: c.Tool}
 	}
 }
 
-// Pending reports how many ops are still in flight (submitted futures + not-yet-
-// delivered submit failures).
-func (r *restateInvoker) Pending() int { return len(r.pending) + len(r.ready) }
-
-// Next drives the in-flight ops until the FIRST settles and returns it. Ops that
-// failed at submit time settle first (immediately available), in ascending handle
-// order; otherwise restate.WaitFirst races the futures and yields the first to
-// complete — in journaled order on replay, so which op "wins" is reproduced. A
-// non-nil error is invocation-fatal (e.g. a Restate cancellation).
-func (r *restateInvoker) Next(_ context.Context) (StepResult, error) {
-	if len(r.ready) > 0 {
-		h := -1
-		for k := range r.ready {
-			if h < 0 || k < h {
-				h = k
-			}
-		}
-		op := r.ready[h]
-		delete(r.ready, h)
-		return StepResult{Handle: h, ErrMsg: op.err.Error(), IsErr: true}, nil
+// Next drives the in-flight ops with ONE restate.WaitFirst and returns the FIRST to
+// settle — in journaled order on replay, so which op "wins" a race is reproduced. The
+// second return is non-nil only for an invocation-fatal condition (e.g. a Restate
+// cancellation); it is returned, not fed back to the guest as a per-op rejection.
+func (r *restateInvoker) Next() (StepResult, error) {
+	if len(r.pending) == 0 {
+		// The guest quiesced still running but nothing is in flight — the program
+		// awaited something that can never complete (a JS-level deadlock, e.g.
+		// `await new Promise(() => {})`). restate.WaitFirst with no futures panics, so
+		// surface it as a clean terminal error instead.
+		return StepResult{}, restate.TerminalErrorf("program made no progress (awaiting with no pending operations)")
 	}
-
 	sels := make([]restate.Future, 0, len(r.pending))
-	handles := make([]int, 0, len(r.pending))
-	for h, op := range r.pending {
+	for _, op := range r.pending {
 		sels = append(sels, op.fut.selectable())
-		handles = append(handles, h)
 	}
-	fut, cancelled := restate.WaitFirst(r.rctx, sels...)
+	winner, cancelled := restate.WaitFirst(r.rctx, sels...)
 	if cancelled != nil {
 		return StepResult{}, cancelled
 	}
-	h := -1
-	for i := range sels {
-		if sels[i] == fut {
-			h = handles[i]
-			break
+	for h, op := range r.pending {
+		if op.fut.selectable() == winner {
+			delete(r.pending, h)
+			return settle(h, op), nil
 		}
 	}
-	if h < 0 {
-		return StepResult{}, restate.TerminalErrorf("WaitFirst returned an unknown future")
-	}
-	op := r.pending[h]
-	delete(r.pending, h)
+	return StepResult{}, restate.TerminalErrorf("WaitFirst returned an unknown future")
+}
+
+// settle extracts a completed op's JSON result into a StepResult: a tool error or
+// invalid JSON becomes StepResult.Err (a per-op rejection); an empty value is null.
+func settle(handle int, op pendingOp) StepResult {
 	v, err := op.fut.resultJSON()
-	if err != nil {
-		return StepResult{Handle: h, ErrMsg: err.Error(), IsErr: true}, nil
+	switch {
+	case err != nil:
+		return StepResult{Handle: handle, Err: err}
+	case len(v) == 0:
+		return StepResult{Handle: handle, Value: json.RawMessage("null")}
+	case !json.Valid(v):
+		return StepResult{Handle: handle, Err: fmt.Errorf("tool %q returned invalid JSON", op.name)}
+	default:
+		return StepResult{Handle: handle, Value: v}
 	}
-	if len(v) == 0 {
-		v = json.RawMessage("null")
-	} else if !json.Valid(v) {
-		return StepResult{Handle: h, ErrMsg: fmt.Sprintf("tool %q returned invalid JSON", op.name), IsErr: true}, nil
-	}
-	return StepResult{Handle: h, Value: v}, nil
 }
 
 // submit turns one tool call into an in-flight durable Future WITHOUT blocking
