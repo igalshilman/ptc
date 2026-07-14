@@ -9,11 +9,11 @@
 // them. Splitting it out of the agent mirrors real use — the services an agent drives
 // live in their own deployment, discovered over the Admin API, not co-deployed.
 //
-// It is served via agent.Deploy, so it makes the SAME dev-listener vs. Restate Cloud
-// tunnel choice as the agent (RESTATE_DEV) — the whole demo is local or all-tunnel
-// together.
+// It is served via agent.Deploy, so it makes the SAME deploy choice as the agent: it
+// listens locally by default, or tunnels to Restate Cloud when RESTATE_TUNNEL is set —
+// the whole demo is local or all-tunnel together.
 //
-//	RESTATE_DEV=1 BACKOFFICE_ADDR=:9081  go run ./examples/backoffice   # listens on :9081
+//	BACKOFFICE_ADDR=:9081  go run ./examples/backoffice   # listens on :9081
 package main
 
 import (

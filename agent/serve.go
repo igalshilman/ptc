@@ -53,22 +53,22 @@ func Serve(ctx context.Context, svc *Service, extra ...restate.ServiceDefinition
 	}
 }
 
-// Deploy exposes a bound *server.Restate to Restate one of two ways, chosen by the
-// environment, and blocks until it stops:
+// Deploy exposes a bound *server.Restate to Restate and blocks until it stops.
 //
-//   - DEV (RESTATE_DEV set): LISTEN on addr; the Restate runtime connects IN, and you
-//     register the deployment by its address (POST /deployments). Simplest for local
-//     Docker — this is what `make run` / the Quick start use.
-//   - otherwise: open an OUTBOUND tunnel to Restate Cloud (no inbound listener or public
-//     URL needed — for private networks / Cloud). Configured from RESTATE_REGION,
-//     RESTATE_ENVIRONMENT_ID, RESTATE_SIGNING_KEY, RESTATE_AUTH_TOKEN (all required), and
-//     RESTATE_TUNNEL_NAME (defaults to name).
+// By DEFAULT (dev-friendly, zero config) it LISTENS on addr: the Restate runtime connects
+// IN and you register the deployment by URL (POST /deployments). This is what `make run`
+// and the Quick start use — nothing to set.
 //
-// name identifies the deployment (the default tunnel name); addr is the dev listen
-// address. Used by both examples so the whole demo is dev-listener or all-tunnel together.
+// Set RESTATE_TUNNEL to instead open an OUTBOUND tunnel to Restate Cloud (no inbound
+// listener or public URL needed — for private networks / Cloud). Tunnel mode also needs
+// RESTATE_REGION, RESTATE_ENVIRONMENT_ID, RESTATE_SIGNING_KEY, RESTATE_AUTH_TOKEN (all
+// required) and RESTATE_TUNNEL_NAME (optional; defaults to name).
+//
+// name identifies the deployment (and is the default tunnel name); addr is the listen
+// address. Both examples deploy through this, so the whole demo listens or tunnels together.
 func Deploy(ctx context.Context, srv *server.Restate, addr, name string) error {
-	if _, dev := os.LookupEnv("RESTATE_DEV"); dev {
-		log.Printf("[%s] dev mode: listening on %s (register this address with Restate)", name, addr)
+	if _, useTunnel := os.LookupEnv("RESTATE_TUNNEL"); !useTunnel {
+		log.Printf("[%s] listening on %s (register this address with Restate)", name, addr)
 		return srv.Start(ctx, addr)
 	}
 
@@ -77,11 +77,11 @@ func Deploy(ctx context.Context, srv *server.Restate, addr, name string) error {
 	signingKey := os.Getenv("RESTATE_SIGNING_KEY")
 	token := os.Getenv("RESTATE_AUTH_TOKEN")
 	if region == "" || envID == "" || signingKey == "" || token == "" {
-		return fmt.Errorf("tunnel mode needs RESTATE_REGION, RESTATE_ENVIRONMENT_ID, " +
-			"RESTATE_SIGNING_KEY and RESTATE_AUTH_TOKEN (or set RESTATE_DEV to listen locally)")
+		return fmt.Errorf("RESTATE_TUNNEL is set but tunnel config is incomplete; need " +
+			"RESTATE_REGION, RESTATE_ENVIRONMENT_ID, RESTATE_SIGNING_KEY and RESTATE_AUTH_TOKEN")
 	}
 	tunnelName := envOr("RESTATE_TUNNEL_NAME", name)
-	log.Printf("[%s] tunnel mode: connecting to Restate Cloud (region %s) as %q", name, region, tunnelName)
+	log.Printf("[%s] tunneling to Restate Cloud (region %s) as %q", name, region, tunnelName)
 	return tunnel.NewTunnel(srv,
 		tunnel.WithRegion(region),
 		tunnel.WithEnvironment(envID, signingKey),

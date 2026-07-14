@@ -37,7 +37,7 @@ quickjs-worker-go/          project root — run all `go` commands here
 │   ├── tool.go              Tool, NewTool (leaf→Future); Future[R] + Run/Call/CallObject/Timer/Awakeable/Signal helpers; reflected arg+result schemas
 │   ├── discover.go          Admin-API handler discovery: DiscoverConfig, AgentToolAnnotation, DiscoverTools, toolFromDescriptor
 │   ├── service.go           Config, Service, NewService, Definitions; Ask/History/Reset; AgentSignals resolve/reject; restateInvoker (Start/Next, WaitFirst driver); openAIModel
-│   ├── serve.go             shared example conveniences: ClientFromEnv (env→client), Serve, Deploy (RESTATE_DEV listener vs. x/tunnel to Cloud)
+│   ├── serve.go             shared example conveniences: ClientFromEnv (env→client), Serve, Deploy (local listener by default; x/tunnel to Cloud when RESTATE_TUNNEL set)
 │   ├── quickjs_guest.wasm   the embedded guest (~600 KB, built from guest-rs/)
 │   ├── agent_test.go        in-package tests + test doubles (~30 tests)
 │   └── bench_test.go        instantiate/round/parallel benchmarks (the pool-decision evidence)
@@ -90,10 +90,10 @@ Chat Completions, no special params), `OPENAI_API_KEY` (REQUIRED —
 orchestrator also reads `RESTATE_ADMIN_URL` (default `http://localhost:9070`) for
 handler discovery; the back-office reads `BACKOFFICE_ADDR` (default `:9081`).
 
-**Deploy mode (`agent.Deploy` in serve.go, used by BOTH examples):** if `RESTATE_DEV` is
-set, each deployment LISTENS locally (Restate connects in — the Docker flow below;
-`make run` sets `RESTATE_DEV=1`). If it is UNSET, each opens an OUTBOUND tunnel to Restate
-Cloud (`github.com/restatedev/sdk-go/x/tunnel`) — no inbound listener/public URL — reading
+**Deploy mode (`agent.Deploy` in serve.go, used by BOTH examples):** by DEFAULT each
+deployment LISTENS locally (Restate connects in — the Docker flow below; `make run` needs
+no flag). Set `RESTATE_TUNNEL` and each instead opens an OUTBOUND tunnel to Restate Cloud
+(`github.com/restatedev/sdk-go/x/tunnel`) — no inbound listener/public URL — also reading
 `RESTATE_REGION`, `RESTATE_ENVIRONMENT_ID`, `RESTATE_SIGNING_KEY`, `RESTATE_AUTH_TOKEN`
 (all required in tunnel mode) and `RESTATE_TUNNEL_NAME` (defaults to the deployment name).
 
@@ -350,7 +350,7 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
 - `github.com/restatedev/sdk-go v1.0.1` (Restate Go SDK; v1.0.1 has the ordered
   WaitIterator that makes the `Promise.race` winner replay-stable — see the race caveat)
 - `github.com/restatedev/sdk-go/x/tunnel v0.1.0` (preview; outbound Restate Cloud tunnel
-  used by `agent.Deploy` when `RESTATE_DEV` is unset)
+  used by `agent.Deploy` when `RESTATE_TUNNEL` is set)
 - `github.com/tetratelabs/wazero v1.9.0` (pure-Go WASM runtime; NO cgo — chosen
   over wasmer-go which is cgo + unmaintained)
 - `github.com/openai/openai-go/v3 v3.41.0` (official, GA)

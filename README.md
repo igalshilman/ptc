@@ -107,31 +107,13 @@ make guest-rs
 | `OPENAI_API_KEY` | required | OpenAI credential; use `dummy` for a keyless local endpoint |
 | `OPENAI_BASE_URL` | OpenAI | OpenAI-compatible API endpoint |
 | `AGENT_MODEL` | `gpt-5` | model used by the orchestrator |
-| `AGENT_ADDR` | `:9080` | agent deployment address (dev/listen mode) |
-| `BACKOFFICE_ADDR` | `:9081` | example back-office address (dev/listen mode) |
+| `AGENT_ADDR` | `:9080` | agent listen address |
+| `BACKOFFICE_ADDR` | `:9081` | example back-office listen address |
 | `RESTATE_ADMIN_URL` | `http://localhost:9070` | Admin API used for discovery |
-| `RESTATE_DEV` | unset | if set, deployments listen locally; if unset, they tunnel to Restate Cloud (see below). `make run` sets it |
 
-### Local listener vs. Restate Cloud tunnel
-
-Both example deployments are served through `agent.Deploy`, which chooses how to reach
-Restate based on the environment:
-
-- **`RESTATE_DEV` set** — each deployment **listens** on its address and the Restate
-  runtime connects in. You register it by URL (the `POST /deployments` calls above). This
-  is the Quick start path; `make run` sets `RESTATE_DEV=1`.
-- **`RESTATE_DEV` unset** — each deployment opens an **outbound tunnel** to Restate Cloud
-  ([`github.com/restatedev/sdk-go/x/tunnel`](https://github.com/restatedev/sdk-go/releases/tag/x/tunnel/v0.1.0)),
-  so it needs no inbound listener or public URL — useful behind NAT or on Cloud. Tunnel
-  mode reads these (all required):
-
-  | Variable | Purpose |
-  |---|---|
-  | `RESTATE_REGION` | Restate Cloud region, e.g. `us` |
-  | `RESTATE_ENVIRONMENT_ID` | environment id, e.g. `env_…` |
-  | `RESTATE_SIGNING_KEY` | environment signing public key, e.g. `publickeyv1_…` |
-  | `RESTATE_AUTH_TOKEN` | Restate Cloud API token |
-  | `RESTATE_TUNNEL_NAME` | deployment name (defaults to `agent` / `backoffice`) |
+By default each deployment listens locally and the Restate runtime connects in, as above.
+To run without a public listener — behind NAT, or on Restate Cloud — see
+[Deploying through a tunnel](#deploying-through-a-tunnel).
 
 ## How one turn runs
 
@@ -347,6 +329,39 @@ invariants.
 - [`examples/backoffice/`](./examples/backoffice): discovered Restate handlers
 - [`DESIGN.md`](./DESIGN.md): tool and concurrency rationale
 - [`CLAUDE.md`](./CLAUDE.md): detailed code map, invariants, and implementation status
+
+## Deploying through a tunnel
+
+By default each deployment listens and you register it by URL (the Quick start). That
+requires the Restate runtime to reach the deployment, which is not always possible —
+behind NAT, or on Restate Cloud.
+
+Set `RESTATE_TUNNEL` and the deployment instead opens an **outbound** connection to
+Restate Cloud through
+[`github.com/restatedev/sdk-go/x/tunnel`](https://github.com/restatedev/sdk-go/releases/tag/x/tunnel/v0.1.0),
+so it needs no inbound listener or public URL. Both examples deploy through `agent.Deploy`,
+so this applies to the agent and the back-office alike.
+
+```bash
+RESTATE_TUNNEL=1 \
+RESTATE_REGION=us \
+RESTATE_ENVIRONMENT_ID=env_... \
+RESTATE_SIGNING_KEY=publickeyv1_... \
+RESTATE_AUTH_TOKEN=... \
+OPENAI_API_KEY=sk-... \
+  go run ./examples/orchestrator
+```
+
+| Variable | Purpose |
+|---|---|
+| `RESTATE_TUNNEL` | set to enable tunnel mode; unset means listen locally (the default) |
+| `RESTATE_REGION` | Restate Cloud region, e.g. `us` |
+| `RESTATE_ENVIRONMENT_ID` | environment id, e.g. `env_…` |
+| `RESTATE_SIGNING_KEY` | environment signing public key, e.g. `publickeyv1_…` |
+| `RESTATE_AUTH_TOKEN` | Restate Cloud API token |
+| `RESTATE_TUNNEL_NAME` | deployment name (optional; defaults to `agent` or `backoffice`) |
+
+`x/tunnel` is a preview (0.x) module; its API may change in a minor release.
 
 ## License
 
