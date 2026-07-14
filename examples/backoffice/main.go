@@ -9,7 +9,11 @@
 // them. Splitting it out of the agent mirrors real use — the services an agent drives
 // live in their own deployment, discovered over the Admin API, not co-deployed.
 //
-//	BACKOFFICE_ADDR=:9081  go run ./examples/backoffice   # serves on :9081
+// It is served via agent.Deploy, so it makes the SAME dev-listener vs. Restate Cloud
+// tunnel choice as the agent (RESTATE_DEV) — the whole demo is local or all-tunnel
+// together.
+//
+//	RESTATE_DEV=1 BACKOFFICE_ADDR=:9081  go run ./examples/backoffice   # listens on :9081
 package main
 
 import (
@@ -18,6 +22,8 @@ import (
 	"os"
 
 	"github.com/restatedev/sdk-go/server"
+
+	"restatedev/agent"
 )
 
 func main() {
@@ -25,12 +31,11 @@ func main() {
 	if addr == "" {
 		addr = ":9081"
 	}
-	log.Printf("order-fulfillment back-office listening on %s", addr)
 	srv := server.NewRestate().
 		Bind(inventoryService()).
 		Bind(riskCheckService()).
 		Bind(paymentsService())
-	if err := srv.Start(context.Background(), addr); err != nil {
+	if err := agent.Deploy(context.Background(), srv, addr, "backoffice"); err != nil {
 		log.Fatalf("backoffice: %v", err)
 	}
 }

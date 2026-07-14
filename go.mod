@@ -5,7 +5,8 @@ go 1.25.0
 require (
 	github.com/invopop/jsonschema v0.14.0
 	github.com/openai/openai-go/v3 v3.41.0
-	github.com/restatedev/sdk-go v1.0.1-0.20260713113405-df79b269735f
+	github.com/restatedev/sdk-go v1.0.1
+	github.com/restatedev/sdk-go/x/tunnel v0.1.0
 	github.com/tetratelabs/wazero v1.9.0
 )
 
@@ -24,5 +25,7 @@ require (
 	go.opentelemetry.io/otel v1.44.0 // indirect
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
 	go.yaml.in/yaml/v4 v4.0.0-rc.2 // indirect
+	golang.org/x/net v0.49.0 // indirect
+	golang.org/x/text v0.33.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )

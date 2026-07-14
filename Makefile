@@ -31,15 +31,15 @@ fmt: ## Format sources
 tidy: ## Tidy go.mod/go.sum
 	go mod tidy
 
-run: ## Run both examples — back-office (:9081) first, then the orchestrator agent (:9080). Needs OPENAI_API_KEY; Ctrl-C stops both.
+run: ## Run both examples in DEV/listener mode — back-office (:9081) then the agent (:9080). Needs OPENAI_API_KEY; Ctrl-C stops both.
 	@go build -o bin/backoffice ./examples/backoffice
 	@go build -o bin/orchestrator ./examples/orchestrator
 	@echo "starting back-office on :9081 …"
-	@./bin/backoffice & bo=$$!; \
+	@RESTATE_DEV=1 ./bin/backoffice & bo=$$!; \
 		trap 'kill $$bo 2>/dev/null' EXIT INT TERM; \
 		sleep 1; \
 		echo "starting orchestrator on :9080 …"; \
-		./bin/orchestrator
+		RESTATE_DEV=1 ./bin/orchestrator
 
 guest-rs: ## Rebuild $(GUEST_WASM) from guest-rs/ (Rust/rquickjs → wasm32-wasip1)
 	cd guest-rs && cargo build --release --target wasm32-wasip1

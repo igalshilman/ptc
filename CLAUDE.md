@@ -37,7 +37,7 @@ quickjs-worker-go/          project root — run all `go` commands here
 │   ├── tool.go              Tool, NewTool (leaf→Future); Future[R] + Run/Call/CallObject/Timer/Awakeable/Signal helpers; reflected arg+result schemas
 │   ├── discover.go          Admin-API handler discovery: DiscoverConfig, AgentToolAnnotation, DiscoverTools, toolFromDescriptor
 │   ├── service.go           Config, Service, NewService, Definitions; Ask/History/Reset; AgentSignals resolve/reject; restateInvoker (Start/Next, WaitFirst driver); openAIModel
-│   ├── serve.go             shared example conveniences: ClientFromEnv (env→client) + Serve (bind+listen)
+│   ├── serve.go             shared example conveniences: ClientFromEnv (env→client), Serve, Deploy (RESTATE_DEV listener vs. x/tunnel to Cloud)
 │   ├── quickjs_guest.wasm   the embedded guest (~600 KB, built from guest-rs/)
 │   ├── agent_test.go        in-package tests + test doubles (~30 tests)
 │   └── bench_test.go        instantiate/round/parallel benchmarks (the pool-decision evidence)
@@ -89,6 +89,13 @@ Chat Completions, no special params), `OPENAI_API_KEY` (REQUIRED —
 `OPENAI_BASE_URL` (optional; point at any OpenAI-compatible endpoint). The
 orchestrator also reads `RESTATE_ADMIN_URL` (default `http://localhost:9070`) for
 handler discovery; the back-office reads `BACKOFFICE_ADDR` (default `:9081`).
+
+**Deploy mode (`agent.Deploy` in serve.go, used by BOTH examples):** if `RESTATE_DEV` is
+set, each deployment LISTENS locally (Restate connects in — the Docker flow below;
+`make run` sets `RESTATE_DEV=1`). If it is UNSET, each opens an OUTBOUND tunnel to Restate
+Cloud (`github.com/restatedev/sdk-go/x/tunnel`) — no inbound listener/public URL — reading
+`RESTATE_REGION`, `RESTATE_ENVIRONMENT_ID`, `RESTATE_SIGNING_KEY`, `RESTATE_AUTH_TOKEN`
+(all required in tunnel mode) and `RESTATE_TUNNEL_NAME` (defaults to the deployment name).
 
 ### Run end-to-end against a real Restate runtime (Docker)
 ```bash
@@ -241,7 +248,7 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
   replay-stable when ≥2 are complete at one poll — `WaitFirst` breaks the tie by input
   order, and handles are deterministic. (This needs the SDK's ordered `WaitIterator`;
   ≤ v1.0.0 tie-broke by Go map order and sorting didn't help — `go.mod` pins the fixed
-  `sdk-go v1.0.1-0.20260713113405-df79b269735f`. See `DESIGN.md`.) An op that can't even be submitted
+  `sdk-go v1.0.1`. See `DESIGN.md`.) An op that can't even be submitted
   (unknown tool / bad args) is a FATAL condition: `Start` **panics**, aborting the whole
   program — it is NOT demoted to a per-op rejection the JS could swallow. A leaf tool that
   returns a zero-value `Future{}` is likewise rejected at `submit` with a terminal error
@@ -340,7 +347,10 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
 - **Committed on `main`.**
 
 ## Dependencies (all published; no replace)
-- `github.com/restatedev/sdk-go v1.0.0` (Restate Go SDK)
+- `github.com/restatedev/sdk-go v1.0.1` (Restate Go SDK; v1.0.1 has the ordered
+  WaitIterator that makes the `Promise.race` winner replay-stable — see the race caveat)
+- `github.com/restatedev/sdk-go/x/tunnel v0.1.0` (preview; outbound Restate Cloud tunnel
+  used by `agent.Deploy` when `RESTATE_DEV` is unset)
 - `github.com/tetratelabs/wazero v1.9.0` (pure-Go WASM runtime; NO cgo — chosen
   over wasmer-go which is cgo + unmaintained)
 - `github.com/openai/openai-go/v3 v3.41.0` (official, GA)
