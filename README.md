@@ -220,7 +220,7 @@ const riskCheck = restate.service({
         return {
           score: Math.floor(input.amount / 20),
           flagged,
-          reason: flagged ? "needs human approval" : "within limit",
+          reason: flagged ? "elevated risk" : "standard risk",
         };
       }
     ),

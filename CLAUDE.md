@@ -25,7 +25,7 @@ quickjs-worker-go/          project root — run all `go` commands here
 │   │                        meant to run as SEPARATE Restate deployments
 │   ├── orchestrator/        an order-fulfillment agent that discovers back-office handlers
 │   │   ├── main.go           ClientFromEnv → NewService{Discover + static tools} → Deploy(Definitions())
-│   │   └── tools.go          the `sleep` (Timer) and `signal` (named-signal approval) tools
+│   │   └── tools.go          the `sleep` (Timer) and `signal` (named external signal) tools
 │   └── backoffice/          standalone deployment of the handlers the agent discovers
 │       ├── main.go           hands its service definitions to agent.Deploy (tunnel)
 │       └── services.go       Inventory / RiskCheck / Payments — annotated for discovery
@@ -215,7 +215,9 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
   a named signal on the current invocation. The framework binds a keyless `AgentSignals`
   service whose `resolve` / `reject` handlers complete a signal by `(invocation, name)`;
   both are annotated for discovery, so a discovering agent gets them as tools — that's how
-  the orchestrator's human-approval step is completed by an external caller.
+  an external caller completes a named signal (e.g. a human-in-the-loop approval). The
+  orchestrator registers the `signal` tool but its fulfillment flow no longer blocks on
+  approval (kept simple for a live demo); the capability is still available.
 - **Sessions:** the service is a Restate **Virtual Object** keyed by session id.
   `Ask` loads the transcript from state (`restate.Get`), runs the loop continuing
   from prior context, and persists it (`restate.Set`) on success only.

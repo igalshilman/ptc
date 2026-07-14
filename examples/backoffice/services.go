@@ -64,7 +64,7 @@ func inventoryService() restate.ServiceDefinition {
 			}, restate.WithMetadata(agent.AgentToolAnnotation, "reserve_stock")))
 }
 
-// ---- RiskCheck: score an order, flag large ones for review -----------------
+// ---- RiskCheck: score an order, flag high-value ones -----------------------
 
 type scoreIn struct {
 	Customer string  `json:"customer" jsonschema:"description=the customer id"`
@@ -82,9 +82,9 @@ func riskCheckService() restate.ServiceDefinition {
 			func(ctx restate.Context, in scoreIn) (scoreOut, error) {
 				score := int(in.Amount / 20) // toy heuristic: larger orders score higher
 				flagged := in.Amount >= 1000
-				reason := "within auto-approval limit"
+				reason := "standard risk"
 				if flagged {
-					reason = "order total >= $1000 — needs human approval"
+					reason = "high-value order (>= $1000): elevated risk"
 				}
 				return scoreOut{Score: score, Flagged: flagged, Reason: reason}, nil
 			}, restate.WithMetadata(agent.AgentToolAnnotation, "risk_score")))
