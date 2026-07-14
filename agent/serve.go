@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"errors"
-	"log"
 	"os"
 
 	"github.com/openai/openai-go/v3"
@@ -15,9 +14,10 @@ import (
 
 // serve.go holds the conveniences an example main() shares on top of the pure API
 // (NewService / Definitions / Close, which is what the tests use): ClientFromEnv resolves
-// the OpenAI client + model from the environment, Serve binds the Service's Restate
-// definitions, and Deploy connects the deployment to Restate Cloud through an outbound
-// tunnel. An example wires them together itself (see examples/orchestrator).
+// the OpenAI client + model from the environment, and Deploy binds a set of Restate
+// service definitions and connects them to Restate Cloud through an outbound tunnel. A
+// main() wires them together — get the definitions from Service.Definitions() (agent) or
+// build them directly (back-office) and hand them to Deploy.
 
 // ClientFromEnv builds an OpenAI(-compatible) client and resolves the model id from the
 // environment: OPENAI_API_KEY (required — fail fast at boot; use "dummy" for a keyless
@@ -35,24 +35,9 @@ func ClientFromEnv() (openai.Client, string, error) {
 	return openai.NewClient(opts...), envOr("AGENT_MODEL", "gpt-5"), nil
 }
 
-// Serve binds the Service's Restate service definitions (plus any extra ones) and connects
-// them to Restate Cloud via Deploy, blocking until it stops. A fatal error exits the process.
-func Serve(ctx context.Context, svc *Service, extra ...restate.ServiceDefinition) {
-	srv := server.NewRestate()
-	for _, d := range svc.Definitions() {
-		srv = srv.Bind(d)
-	}
-	for _, d := range extra {
-		srv = srv.Bind(d)
-	}
-	if err := Deploy(ctx, srv, "agent"); err != nil {
-		log.Fatalf("agent.Serve: %v", err)
-	}
-}
-
-// Deploy connects a bound *server.Restate to Restate Cloud through an outbound tunnel
-// (github.com/restatedev/sdk-go/x/tunnel) and blocks until it stops — no inbound listener
-// or public URL.
+// Deploy binds the given Restate service definitions and connects them to Restate Cloud
+// through an outbound tunnel (github.com/restatedev/sdk-go/x/tunnel), blocking until it
+// stops — no inbound listener or public URL.
 //
 // All tunnel configuration (environment id, signing key, cloud region / servers, auth
 // token) is read by the tunnel itself from the injected environment; Deploy passes none
@@ -60,7 +45,11 @@ func Serve(ctx context.Context, svc *Service, extra ...restate.ServiceDefinition
 // co-deployed services can't share a single RESTATE_INPROC_TUNNEL_NAME — so pass a
 // non-empty tunnelName to set it in code; pass "" to let the tunnel read
 // RESTATE_INPROC_TUNNEL_NAME from the environment.
-func Deploy(ctx context.Context, srv *server.Restate, tunnelName string) error {
+func Deploy(ctx context.Context, tunnelName string, defs ...restate.ServiceDefinition) error {
+	srv := server.NewRestate()
+	for _, d := range defs {
+		srv = srv.Bind(d)
+	}
 	var opts []tunnel.Option
 	if tunnelName != "" {
 		opts = append(opts, tunnel.WithTunnelName(tunnelName))

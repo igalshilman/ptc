@@ -24,10 +24,10 @@ quickjs-worker-go/          project root — run all `go` commands here
 ├── examples/               runnable demo binaries (USER code) — each is a package main,
 │   │                        meant to run as SEPARATE Restate deployments
 │   ├── orchestrator/        an order-fulfillment agent that discovers back-office handlers
-│   │   ├── main.go           ClientFromEnv → NewService{Discover + static tools} → Serve
+│   │   ├── main.go           ClientFromEnv → NewService{Discover + static tools} → Deploy(Definitions())
 │   │   └── tools.go          the `sleep` (Timer) and `signal` (named-signal approval) tools
 │   └── backoffice/          standalone deployment of the handlers the agent discovers
-│       ├── main.go           binds the services on :9081 (plain restate server, no agent)
+│       ├── main.go           hands its service definitions to agent.Deploy (tunnel)
 │       └── services.go       Inventory / RiskCheck / Payments — annotated for discovery
 ├── agent/                  package agent — reusable durable-CodeAct engine (INFRA)
 │   ├── engine.go            wazero driver + instance pool + RunLive (the live-coroutine drive loop); WASI clock/rand pin; //go:embed of the guest; the host↔guest wire types (guestStep/ToolCall/StepResult)
@@ -37,7 +37,7 @@ quickjs-worker-go/          project root — run all `go` commands here
 │   ├── tool.go              Tool, NewTool (leaf→Future); Future[R] + Run/Call/CallObject/Timer/Awakeable/Signal helpers; reflected arg+result schemas
 │   ├── discover.go          Admin-API handler discovery: DiscoverConfig, AgentToolAnnotation, DiscoverTools, toolFromDescriptor
 │   ├── service.go           Config, Service, NewService, Definitions; Ask/History/Reset; AgentSignals resolve/reject; restateInvoker (Start/Next, WaitFirst driver); openAIModel
-│   ├── serve.go             shared example conveniences: ClientFromEnv (env→client), Serve, Deploy (outbound x/tunnel to Restate Cloud)
+│   ├── serve.go             shared example conveniences: ClientFromEnv (env→client) + Deploy (bind defs → outbound x/tunnel to Restate Cloud)
 │   ├── quickjs_guest.wasm   the embedded guest (~600 KB, built from guest-rs/)
 │   ├── agent_test.go        in-package tests + test doubles (~30 tests)
 │   └── bench_test.go        instantiate/round/parallel benchmarks (the pool-decision evidence)
@@ -47,11 +47,11 @@ quickjs-worker-go/          project root — run all `go` commands here
 - **Entry commands:** `go run ./examples/orchestrator` (the agent) and, as a separate
   deployment, `go run ./examples/backoffice` (the handlers it discovers) — the module
   root and `agent/` are NOT runnable (no `main`). The orchestrator is a tiny `main()`
-  that builds a tool set and wires it via `NewService` / `Serve` (see serve.go); the
-  back-office is a plain Restate service deployment.
+  that builds a tool set, `NewService`s it, and hands `svc.Definitions()` to `Deploy`
+  (see serve.go); the back-office hands its own definitions to `Deploy` the same way.
 - **Public API** the example uses from the `agent` package:
   - lifecycle: `Config`, `NewService`, `Service.Definitions()`, `Service.Close()`, and
-    the example conveniences `ClientFromEnv` / `Serve` (serve.go);
+    the example conveniences `ClientFromEnv` / `Deploy` (serve.go);
   - tools: `Tool`, `NewTool`, `Future[R]`, and the future helpers `Run` / `Call` /
     `CallObject` / `Timer` / `Awakeable` / `Signal`;
   - discovery: `DiscoverConfig`, `AgentToolAnnotation`, `DiscoverTools`.
@@ -88,7 +88,7 @@ params), `OPENAI_API_KEY` (REQUIRED — `ClientFromEnv` fails at boot if unset; 
 for a keyless local endpoint), `OPENAI_BASE_URL` (optional; any OpenAI-compatible
 endpoint). The orchestrator also reads `RESTATE_ADMIN_URL` for handler discovery.
 
-**Deploy (`agent.Deploy(ctx, srv, tunnelName)` in serve.go, used by BOTH examples):**
+**Deploy (`agent.Deploy(ctx, tunnelName, defs...)` in serve.go, used by BOTH examples):**
 always connects OUTBOUND to Restate Cloud via `github.com/restatedev/sdk-go/x/tunnel` — no
 inbound listener or public URL, no local-listener mode. It sets ONLY the tunnel name
 (`tunnel.WithTunnelName(tunnelName)` when non-empty — the examples pass `agent` /

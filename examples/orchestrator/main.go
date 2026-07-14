@@ -20,7 +20,7 @@
 //
 //     OPENAI_API_KEY=sk-...  go run ./examples/orchestrator
 //
-// It connects to Restate Cloud through an outbound tunnel (agent.Serve → agent.Deploy);
+// It connects to Restate Cloud through an outbound tunnel (agent.Deploy);
 // the back-office runs as its own tunneled deployment (./examples/backoffice). Discovery
 // runs LAZILY on each Ask (journaled for replay), not at startup, so it doesn't matter
 // which deployment registers first, and new annotated services are picked up on the next
@@ -63,6 +63,8 @@ func main() {
 	}
 	defer svc.Close(ctx)
 
-	// Bind the agent's Restate definitions and connect to Restate Cloud via the tunnel.
-	agent.Serve(ctx, svc)
+	// Deploy the agent's Restate definitions to Restate Cloud through the tunnel (name "agent").
+	if err := agent.Deploy(ctx, "agent", svc.Definitions()...); err != nil {
+		log.Fatalf("orchestrator: %v", err)
+	}
 }

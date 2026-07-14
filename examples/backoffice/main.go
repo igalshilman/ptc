@@ -17,17 +17,13 @@ import (
 	"context"
 	"log"
 
-	"github.com/restatedev/sdk-go/server"
-
 	"restatedev/agent"
 )
 
 func main() {
-	srv := server.NewRestate().
-		Bind(inventoryService()).
-		Bind(riskCheckService()).
-		Bind(paymentsService())
-	if err := agent.Deploy(context.Background(), srv, "backoffice"); err != nil {
+	// Deploy the annotated handlers to Restate Cloud through the tunnel (name "backoffice").
+	if err := agent.Deploy(context.Background(), "backoffice",
+		inventoryService(), riskCheckService(), paymentsService()); err != nil {
 		log.Fatalf("backoffice: %v", err)
 	}
 }
