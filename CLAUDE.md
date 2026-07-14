@@ -25,7 +25,7 @@ quickjs-worker-go/          project root — run all `go` commands here
 │   │                        meant to run as SEPARATE Restate deployments
 │   ├── orchestrator/        an order-fulfillment agent that discovers back-office handlers
 │   │   ├── main.go           ClientFromEnv → NewService{Discover + static tools} → Deploy(Definitions())
-│   │   └── tools.go          the `sleep` (Timer) and `signal` (named external signal) tools
+│   │   └── tools.go          the `sleep` (Timer) and `signal` (named-signal human approval) tools
 │   └── backoffice/          standalone deployment of the handlers the agent discovers
 │       ├── main.go           hands its service definitions to agent.Deploy (tunnel)
 │       └── services.go       Inventory / RiskCheck / Payments — annotated for discovery
@@ -105,9 +105,10 @@ operator-injected env: `RESTATE_INPROC_ENVIRONMENT_ID`, `RESTATE_INPROC_SIGNING_
 OPENAI_API_KEY=sk-... go run ./examples/orchestrator &   # tunnels out; self-registers
 OPENAI_API_KEY=sk-... go run ./examples/backoffice &     # tunnels out; self-registers
 # invoke via your Restate Cloud environment's ingress (object key = session id):
-#   POST <ingress>/Agent/<session>/Ask     {"message":"fulfill order #42: …"}
+#   POST <ingress>/Agent/<session>/Ask     {"message":"fulfill order #42: 2x SKU-1, total $200"}
 #   POST <ingress>/Agent/<session>/History
 #   POST <ingress>/Agent/<session>/Reset
+# a >= $1000 order additionally triggers the human-approval signal (see Named signals).
 ```
 
 ### Rebuild the QuickJS guest (only if you edit guest-rs/)
@@ -216,8 +217,10 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
   service whose `resolve` / `reject` handlers complete a signal by `(invocation, name)`;
   both are annotated for discovery, so a discovering agent gets them as tools — that's how
   an external caller completes a named signal (e.g. a human-in-the-loop approval). The
-  orchestrator registers the `signal` tool but its fulfillment flow no longer blocks on
-  approval (kept simple for a live demo); the capability is still available.
+  orchestrator uses this for high-value orders: RiskCheck flags totals >= $1000 as
+  "requires human approval", so the agent opens a signal and blocks before charging until
+  an external caller resolves it. The DEFAULT demo order is under $1000 (happy path charges
+  straight through, easy for a live demo); send a >= $1000 order to exercise approval.
 - **Sessions:** the service is a Restate **Virtual Object** keyed by session id.
   `Ask` loads the transcript from state (`restate.Get`), runs the loop continuing
   from prior context, and persists it (`restate.Set`) on success only.

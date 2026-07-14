@@ -52,10 +52,15 @@ to register and no local port. Invoke the agent through your environment's Resta
 keyed by session id, exposes three handlers:
 
 ```text
-POST  <ingress>/Agent/<session>/Ask       {"message":"fulfill order #42: 3x SKU-1, 1x SKU-9, total $1200"}
+POST  <ingress>/Agent/<session>/Ask       {"message":"fulfill order #42: 2x SKU-1, total $200"}
 POST  <ingress>/Agent/<session>/History
 POST  <ingress>/Agent/<session>/Reset
 ```
+
+That `$200` order charges straight through. To show the **human-in-the-loop** path, send
+an order over `$1000` (e.g. `total $1200`): RiskCheck flags it, so the agent opens a named
+signal and blocks before charging. Complete it by invoking the framework's `AgentSignals`
+`resolve` handler with the invocation id and signal name the agent logs when it waits.
 
 Both deployments must be connected. Without the back-office, the agent still runs but
 cannot discover the example Inventory, RiskCheck, or Payments handlers.
@@ -115,8 +120,8 @@ A generated program looks like this:
 
 ```js
 const [stock, risk] = await Promise.all([
-  reserve_stock({ key: "SKU-1", input: { qty: 3 } }),
-  risk_score({ customer: "c-17", amount: 1200 }),
+  reserve_stock({ key: "SKU-1", input: { qty: 2 } }),
+  risk_score({ customer: "c-17", amount: 200 }),
 ]);
 
 if (!stock.ok) {
@@ -220,7 +225,7 @@ const riskCheck = restate.service({
         return {
           score: Math.floor(input.amount / 20),
           flagged,
-          reason: flagged ? "elevated risk" : "standard risk",
+          reason: flagged ? "requires human approval" : "standard risk",
         };
       }
     ),

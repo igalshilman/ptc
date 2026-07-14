@@ -1,8 +1,11 @@
 // Command orchestrator is an example durable CodeAct agent: an autonomous
 // ORDER-FULFILLMENT agent dropped into a Restate deployment. It discovers the durable
 // handlers you've annotated and orchestrates them via generated code — reserving stock
-// for each line item in PARALLEL, scoring the order's risk, and charging payment. Every
-// step is durable: crash it mid-run and it resumes; payment is charged exactly once.
+// for each line item in PARALLEL, scoring the order's risk, and charging payment. A
+// normal order charges straight through; a high-value one (RiskCheck flags totals
+// >= $1000 as "requires human approval") makes the agent open a named SIGNAL and block
+// for approval before charging. Every step is durable: crash it mid-wait, or let it wait
+// overnight, and it resumes; payment is charged exactly once.
 //
 // It combines two kinds of tool:
 //
@@ -11,12 +14,11 @@
 //     discovered from the Admin API — reserve_stock (keyed Inventory), risk_score
 //     (RiskCheck), charge_payment (Payments), all served by the SEPARATE back-office
 //     deployment (see ./examples/backoffice), plus resolve/reject from the framework's
-//     own AgentSignals service. No manual wiring.
+//     own AgentSignals service (how a human completes the approval). No manual wiring.
 //
 //   - Two RESTATE PRIMITIVES that aren't just handler calls, as static tools: sleep
-//     (durable timer) and signal (create + await a named external signal — e.g. a
-//     human-in-the-loop approval; registered and available, though the fulfillment flow
-//     above doesn't use it).
+//     (durable timer) and signal (create + await a named external signal — the
+//     human-in-the-loop approval used for a flagged order).
 //
 //     OPENAI_API_KEY=sk-...  go run ./examples/orchestrator
 //
