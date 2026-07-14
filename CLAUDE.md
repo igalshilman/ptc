@@ -95,7 +95,7 @@ inbound listener or public URL, no local-listener mode. It sets ONLY the tunnel 
 `backoffice` so co-deployed services don't collide; empty → the tunnel reads
 `RESTATE_INPROC_TUNNEL_NAME`). Everything else the tunnel reads itself from the
 operator-injected env: `RESTATE_TUNNEL`, `RESTATE_INPROC_ENVIRONMENT_ID`,
-`RESTATE_INPROC_SIGNING_PUBLIC_KEY`, `RESTATE_INPROC_AUTH_TOKEN` (or `RESTATE_AUTH_TOKEN`),
+`RESTATE_INPROC_SIGNING_PUBLIC_KEY`, `RESTATE_AUTH_TOKEN` (or `RESTATE_INPROC_AUTH_TOKEN_FILE`),
 and `RESTATE_TUNNEL_SERVERS_SRV` (or `RESTATE_INPROC_CLOUD_REGION`). See the README's
 "Deploying through a tunnel".
 

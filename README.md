@@ -316,7 +316,7 @@ Set the tunnel environment, then run either example:
 ```bash
 export RESTATE_TUNNEL=1
 export RESTATE_INPROC_ENVIRONMENT_ID=env_...              # Restate Cloud environment id
-export RESTATE_INPROC_AUTH_TOKEN="$RESTATE_AUTH_TOKEN"    # Restate Cloud API token
+export RESTATE_AUTH_TOKEN=...                             # Restate Cloud API token
 export RESTATE_INPROC_SIGNING_PUBLIC_KEY=publickeyv1_...  # environment signing public key
 export RESTATE_TUNNEL_SERVERS_SRV=tunnel.us.restate.cloud # regional tunnel servers (SRV)
 
@@ -328,7 +328,7 @@ OPENAI_API_KEY=sk-... go run ./examples/backoffice       # tunnel name: backoffi
 |---|---|
 | `RESTATE_TUNNEL` | selects in-process tunnel mode |
 | `RESTATE_INPROC_ENVIRONMENT_ID` | Restate Cloud environment id (`env_…`) |
-| `RESTATE_INPROC_AUTH_TOKEN` | Restate Cloud API token (`RESTATE_INPROC_AUTH_TOKEN_FILE` reads it from a file) |
+| `RESTATE_AUTH_TOKEN` | Restate Cloud API token (or `RESTATE_INPROC_AUTH_TOKEN_FILE` to read it from a file) |
 | `RESTATE_INPROC_SIGNING_PUBLIC_KEY` | environment signing public key (`publickeyv1_…`) |
 | `RESTATE_TUNNEL_SERVERS_SRV` | regional tunnel servers, e.g. `tunnel.us.restate.cloud` (or `RESTATE_INPROC_CLOUD_REGION`) |
 | `RESTATE_INPROC_TUNNEL_NAME` | fallback tunnel name — used only when a deployment passes an empty name; the examples set theirs in code |
