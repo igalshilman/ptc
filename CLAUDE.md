@@ -244,7 +244,7 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
   replay-stable when ≥2 are complete at one poll — `WaitFirst` breaks the tie by input
   order, and handles are deterministic. (This needs the SDK's ordered `WaitIterator`;
   ≤ v1.0.0 tie-broke by Go map order and sorting didn't help — `go.mod` pins the fixed
-  `sdk-go v1.0.1`. See `DESIGN.md`.) An op that can't even be submitted
+  `sdk-go` ≥ v1.0.1 (v1.0.2 pinned). See `DESIGN.md`.) An op that can't even be submitted
   (unknown tool / bad args) is a FATAL condition: `Start` **panics**, aborting the whole
   program — it is NOT demoted to a per-op rejection the JS could swallow. A leaf tool that
   returns a zero-value `Future{}` is likewise rejected at `submit` with a terminal error
@@ -343,8 +343,8 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
 - **Committed on `main`.**
 
 ## Dependencies (all published; no replace)
-- `github.com/restatedev/sdk-go v1.0.1` (Restate Go SDK; v1.0.1 has the ordered
-  WaitIterator that makes the `Promise.race` winner replay-stable — see the race caveat)
+- `github.com/restatedev/sdk-go v1.0.2` (Restate Go SDK; the ordered WaitIterator that
+  makes the `Promise.race` winner replay-stable landed in v1.0.1 — see the race caveat)
 - `github.com/restatedev/sdk-go/x/tunnel v0.1.0` (preview; outbound Restate Cloud tunnel
   used by `agent.Deploy` to connect outbound to Restate Cloud)
 - `github.com/tetratelabs/wazero v1.9.0` (pure-Go WASM runtime; NO cgo — chosen

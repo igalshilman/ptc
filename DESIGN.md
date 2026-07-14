@@ -129,7 +129,7 @@ program the winner is reproduced across replays. This relies on the SDK's *order
 `WaitIterator` (a slice, not a map): earlier sdk-go (≤ v1.0.0) tie-broke by Go
 map-iteration order, so the winner was not replay-stable and sorting `sels` didn't help
 (the iterator re-copied into its own map); it is fixed as of
-`sdk-go v1.0.1`, which `go.mod` pins. `Promise.all` never
+`sdk-go v1.0.2`, which `go.mod` pins (the fix landed in v1.0.1). `Promise.all` never
 depended on this (order-independent).
 
 ## Why not the alternatives (considered, rejected)
