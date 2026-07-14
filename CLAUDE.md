@@ -37,7 +37,7 @@ quickjs-worker-go/          project root — run all `go` commands here
 │   ├── tool.go              Tool, NewTool (leaf→Future); Future[R] + Run/Call/CallObject/Timer/Awakeable/Signal helpers; reflected arg+result schemas
 │   ├── discover.go          Admin-API handler discovery: DiscoverConfig, AgentToolAnnotation, DiscoverTools, toolFromDescriptor
 │   ├── service.go           Config, Service, NewService, Definitions; Ask/History/Reset; AgentSignals resolve/reject; restateInvoker (Start/Next, WaitFirst driver); openAIModel
-│   ├── serve.go             shared example conveniences: ClientFromEnv (env→client), Serve, Deploy (local listener by default; x/tunnel to Cloud when RESTATE_TUNNEL set)
+│   ├── serve.go             shared example conveniences: ClientFromEnv (env→client), Serve, Deploy (outbound x/tunnel to Restate Cloud)
 │   ├── quickjs_guest.wasm   the embedded guest (~600 KB, built from guest-rs/)
 │   ├── agent_test.go        in-package tests + test doubles (~30 tests)
 │   └── bench_test.go        instantiate/round/parallel benchmarks (the pool-decision evidence)
@@ -82,36 +82,32 @@ There's also a `Makefile` (`make help` lists targets: build/test/vet/fmt/tidy/ru
 `agent/quickjs_guest.wasm` is a COMMITTED prebuilt artifact (so `go build` needs
 only Go); rebuild it with `make guest-rs` after editing `guest-rs/`.
 
-Env vars: `AGENT_ADDR` (default `:9080`), `AGENT_MODEL` (default `gpt-5`; the
-project's key also has gpt-5-mini/nano/gpt-5.1/gpt-5.2 — gpt-5 works via plain
-Chat Completions, no special params), `OPENAI_API_KEY` (REQUIRED —
-`ClientFromEnv` fails at boot if unset; use `dummy` for a keyless local endpoint),
-`OPENAI_BASE_URL` (optional; point at any OpenAI-compatible endpoint). The
-orchestrator also reads `RESTATE_ADMIN_URL` (default `http://localhost:9070`) for
-handler discovery; the back-office reads `BACKOFFICE_ADDR` (default `:9081`).
+Env vars: `AGENT_MODEL` (default `gpt-5`; the project's key also has
+gpt-5-mini/nano/gpt-5.1/gpt-5.2 — gpt-5 works via plain Chat Completions, no special
+params), `OPENAI_API_KEY` (REQUIRED — `ClientFromEnv` fails at boot if unset; use `dummy`
+for a keyless local endpoint), `OPENAI_BASE_URL` (optional; any OpenAI-compatible
+endpoint). The orchestrator also reads `RESTATE_ADMIN_URL` for handler discovery.
 
-**Deploy mode (`agent.Deploy` in serve.go, used by BOTH examples):** by DEFAULT each
-deployment LISTENS locally (Restate connects in — the Docker flow below; `make run` needs
-no flag). Set `RESTATE_TUNNEL` and each instead opens an OUTBOUND tunnel to Restate Cloud
-(`github.com/restatedev/sdk-go/x/tunnel`) — no inbound listener/public URL — also reading
-`RESTATE_REGION`, `RESTATE_ENVIRONMENT_ID`, `RESTATE_SIGNING_KEY`, `RESTATE_AUTH_TOKEN`
-(all required in tunnel mode) and `RESTATE_TUNNEL_NAME` (defaults to the deployment name).
+**Deploy (`agent.Deploy(ctx, srv, tunnelName)` in serve.go, used by BOTH examples):**
+always connects OUTBOUND to Restate Cloud via `github.com/restatedev/sdk-go/x/tunnel` — no
+inbound listener or public URL, no local-listener mode. It sets ONLY the tunnel name
+(`tunnel.WithTunnelName(tunnelName)` when non-empty — the examples pass `agent` /
+`backoffice` so co-deployed services don't collide; empty → the tunnel reads
+`RESTATE_INPROC_TUNNEL_NAME`). Everything else the tunnel reads itself from the
+operator-injected env: `RESTATE_TUNNEL`, `RESTATE_INPROC_ENVIRONMENT_ID`,
+`RESTATE_INPROC_SIGNING_PUBLIC_KEY`, `RESTATE_INPROC_AUTH_TOKEN` (or `RESTATE_AUTH_TOKEN`),
+and `RESTATE_TUNNEL_SERVERS_SRV` (or `RESTATE_INPROC_CLOUD_REGION`). See the README's
+"Deploying through a tunnel".
 
-### Run end-to-end against a real Restate runtime (Docker)
+### Run end-to-end (Restate Cloud, via the tunnel)
 ```bash
-OPENAI_API_KEY=sk-... go run ./examples/orchestrator &       # agent on :9080
-                      go run ./examples/backoffice &         # back-office on :9081
-docker run -d --name restate -p 8080:8080 -p 9070:9070 \
-  --add-host=host.docker.internal:host-gateway restatedev/restate:latest
-# register BOTH deployments so the agent discovers the back-office:
-curl -X POST http://localhost:9070/deployments \
-  -H content-type:application/json -d '{"uri":"http://host.docker.internal:9080"}'
-curl -X POST http://localhost:9070/deployments \
-  -H content-type:application/json -d '{"uri":"http://host.docker.internal:9081"}'
-# talk to a session (object key = session id):
-curl http://localhost:8080/Agent/s1/Ask -H content-type:application/json -d '{"message":"fulfill order #42: 3x SKU-1, 1x SKU-9, total $1200"}'
-curl -X POST http://localhost:8080/Agent/s1/History   # transcript (empty body — Void input)
-curl -X POST http://localhost:8080/Agent/s1/Reset     # clear the session
+# set the tunnel env (see README "Deploying through a tunnel"), then:
+OPENAI_API_KEY=sk-... go run ./examples/orchestrator &   # tunnels out; self-registers
+OPENAI_API_KEY=sk-... go run ./examples/backoffice &     # tunnels out; self-registers
+# invoke via your Restate Cloud environment's ingress (object key = session id):
+#   POST <ingress>/Agent/<session>/Ask     {"message":"fulfill order #42: …"}
+#   POST <ingress>/Agent/<session>/History
+#   POST <ingress>/Agent/<session>/Reset
 ```
 
 ### Rebuild the QuickJS guest (only if you edit guest-rs/)
@@ -350,7 +346,7 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
 - `github.com/restatedev/sdk-go v1.0.1` (Restate Go SDK; v1.0.1 has the ordered
   WaitIterator that makes the `Promise.race` winner replay-stable — see the race caveat)
 - `github.com/restatedev/sdk-go/x/tunnel v0.1.0` (preview; outbound Restate Cloud tunnel
-  used by `agent.Deploy` when `RESTATE_TUNNEL` is set)
+  used by `agent.Deploy` to connect outbound to Restate Cloud)
 - `github.com/tetratelabs/wazero v1.9.0` (pure-Go WASM runtime; NO cgo — chosen
   over wasmer-go which is cgo + unmaintained)
 - `github.com/openai/openai-go/v3 v3.41.0` (official, GA)

@@ -31,14 +31,14 @@ fmt: ## Format sources
 tidy: ## Tidy go.mod/go.sum
 	go mod tidy
 
-run: ## Run both examples locally — back-office (:9081) then the agent (:9080). Needs OPENAI_API_KEY; Ctrl-C stops both.
+run: ## Run both deployments (they tunnel to Restate Cloud). Needs OPENAI_API_KEY + the RESTATE_INPROC_* tunnel env (see README); Ctrl-C stops both.
 	@go build -o bin/backoffice ./examples/backoffice
 	@go build -o bin/orchestrator ./examples/orchestrator
-	@echo "starting back-office on :9081 …"
+	@echo "starting back-office …"
 	@./bin/backoffice & bo=$$!; \
 		trap 'kill $$bo 2>/dev/null' EXIT INT TERM; \
 		sleep 1; \
-		echo "starting orchestrator on :9080 …"; \
+		echo "starting orchestrator …"; \
 		./bin/orchestrator
 
 guest-rs: ## Rebuild $(GUEST_WASM) from guest-rs/ (Rust/rquickjs → wasm32-wasip1)

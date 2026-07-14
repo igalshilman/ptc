@@ -28,62 +28,37 @@ The project provides:
 ### Prerequisites
 
 - Go 1.25 or newer
-- Docker
 - an OpenAI API key, or an OpenAI-compatible endpoint
+- a Restate Cloud environment (the examples connect to it through a tunnel)
 
-The committed QuickJS WASM guest means normal builds need only Go:
+The committed QuickJS WASM guest means normal builds and tests need only Go:
 
 ```bash
 go build ./...
 go test ./...
 ```
 
-Start a local Restate runtime:
-
-```bash
-docker run --rm -d --name restate \
-  -p 8080:8080 -p 9070:9070 \
-  --add-host=host.docker.internal:host-gateway \
-  restatedev/restate:latest
-```
-
-In another terminal, start both example deployments. `make run` starts the
-back-office on `:9081`, then the agent on `:9080`:
+To run the examples, deploy both through the tunnel. Set the tunnel environment
+(see [Deploying through a tunnel](#deploying-through-a-tunnel)), then start them —
+`make run` starts the back-office, then the agent:
 
 ```bash
 OPENAI_API_KEY=sk-... make run
 ```
 
-Register both deployments with Restate:
+Each example connects **out** to Restate Cloud and registers itself, so there is no URL
+to register and no local port. Invoke the agent through your environment's Restate ingress
+(see the Restate Cloud docs for the ingress URL and auth). The `Agent` virtual object,
+keyed by session id, exposes three handlers:
 
-```bash
-curl -X POST http://localhost:9070/deployments \
-  -H 'content-type: application/json' \
-  -d '{"uri":"http://host.docker.internal:9080"}'
-
-curl -X POST http://localhost:9070/deployments \
-  -H 'content-type: application/json' \
-  -d '{"uri":"http://host.docker.internal:9081"}'
+```text
+POST  <ingress>/Agent/<session>/Ask       {"message":"fulfill order #42: 3x SKU-1, 1x SKU-9, total $1200"}
+POST  <ingress>/Agent/<session>/History
+POST  <ingress>/Agent/<session>/Reset
 ```
 
-Then send a message to session `s1`:
-
-```bash
-curl http://localhost:8080/Agent/s1/Ask \
-  -H 'content-type: application/json' \
-  -d '{"message":"fulfill order #42: 3x SKU-1, 1x SKU-9, total $1200"}'
-```
-
-Session history and reset are exposed as separate handlers:
-
-```bash
-curl -X POST http://localhost:8080/Agent/s1/History
-curl -X POST http://localhost:8080/Agent/s1/Reset
-```
-
-Both deployments must be registered. Without the back-office deployment, the
-agent can still start, but it cannot discover the example Inventory, RiskCheck,
-or Payments handlers.
+Both deployments must be connected. Without the back-office, the agent still runs but
+cannot discover the example Inventory, RiskCheck, or Payments handlers.
 
 ### Development shell
 
@@ -107,13 +82,10 @@ make guest-rs
 | `OPENAI_API_KEY` | required | OpenAI credential; use `dummy` for a keyless local endpoint |
 | `OPENAI_BASE_URL` | OpenAI | OpenAI-compatible API endpoint |
 | `AGENT_MODEL` | `gpt-5` | model used by the orchestrator |
-| `AGENT_ADDR` | `:9080` | agent listen address |
-| `BACKOFFICE_ADDR` | `:9081` | example back-office listen address |
-| `RESTATE_ADMIN_URL` | `http://localhost:9070` | Admin API used for discovery |
+| `RESTATE_ADMIN_URL` | Admin API | Restate Admin API used for handler discovery |
 
-By default each deployment listens locally and the Restate runtime connects in, as above.
-To run without a public listener — behind NAT, or on Restate Cloud — see
-[Deploying through a tunnel](#deploying-through-a-tunnel).
+Both deployments connect to Restate Cloud through an outbound tunnel; that needs a few
+more variables — see [Deploying through a tunnel](#deploying-through-a-tunnel).
 
 ## How one turn runs
 
@@ -332,36 +304,37 @@ invariants.
 
 ## Deploying through a tunnel
 
-By default each deployment listens and you register it by URL (the Quick start). That
-requires the Restate runtime to reach the deployment, which is not always possible —
-behind NAT, or on Restate Cloud.
-
-Set `RESTATE_TUNNEL` and the deployment instead opens an **outbound** connection to
-Restate Cloud through
+Each deployment connects **outbound** to Restate Cloud through
 [`github.com/restatedev/sdk-go/x/tunnel`](https://github.com/restatedev/sdk-go/releases/tag/x/tunnel/v0.1.0),
-so it needs no inbound listener or public URL. Both examples deploy through `agent.Deploy`,
-so this applies to the agent and the back-office alike.
+so it needs no inbound listener or public URL. `agent.Deploy(ctx, srv, tunnelName)` sets
+only the tunnel **name** from its argument (the examples pass `agent` and `backoffice`, so
+the two can be co-deployed without colliding); the tunnel reads everything else from the
+environment (the variables the Restate operator injects for in-process tunnel mode).
+
+Set the tunnel environment, then run either example:
 
 ```bash
-RESTATE_TUNNEL=1 \
-RESTATE_REGION=us \
-RESTATE_ENVIRONMENT_ID=env_... \
-RESTATE_SIGNING_KEY=publickeyv1_... \
-RESTATE_AUTH_TOKEN=... \
-OPENAI_API_KEY=sk-... \
-  go run ./examples/orchestrator
+export RESTATE_TUNNEL=1
+export RESTATE_INPROC_ENVIRONMENT_ID=env_...              # Restate Cloud environment id
+export RESTATE_INPROC_AUTH_TOKEN="$RESTATE_AUTH_TOKEN"    # Restate Cloud API token
+export RESTATE_INPROC_SIGNING_PUBLIC_KEY=publickeyv1_...  # environment signing public key
+export RESTATE_TUNNEL_SERVERS_SRV=tunnel.us.restate.cloud # regional tunnel servers (SRV)
+
+OPENAI_API_KEY=sk-... go run ./examples/orchestrator     # tunnel name: agent
+OPENAI_API_KEY=sk-... go run ./examples/backoffice       # tunnel name: backoffice
 ```
 
 | Variable | Purpose |
 |---|---|
-| `RESTATE_TUNNEL` | set to enable tunnel mode; unset means listen locally (the default) |
-| `RESTATE_REGION` | Restate Cloud region, e.g. `us` |
-| `RESTATE_ENVIRONMENT_ID` | environment id, e.g. `env_…` |
-| `RESTATE_SIGNING_KEY` | environment signing public key, e.g. `publickeyv1_…` |
-| `RESTATE_AUTH_TOKEN` | Restate Cloud API token |
-| `RESTATE_TUNNEL_NAME` | deployment name (optional; defaults to `agent` or `backoffice`) |
+| `RESTATE_TUNNEL` | selects in-process tunnel mode |
+| `RESTATE_INPROC_ENVIRONMENT_ID` | Restate Cloud environment id (`env_…`) |
+| `RESTATE_INPROC_AUTH_TOKEN` | Restate Cloud API token (`RESTATE_INPROC_AUTH_TOKEN_FILE` reads it from a file) |
+| `RESTATE_INPROC_SIGNING_PUBLIC_KEY` | environment signing public key (`publickeyv1_…`) |
+| `RESTATE_TUNNEL_SERVERS_SRV` | regional tunnel servers, e.g. `tunnel.us.restate.cloud` (or `RESTATE_INPROC_CLOUD_REGION`) |
+| `RESTATE_INPROC_TUNNEL_NAME` | fallback tunnel name — used only when a deployment passes an empty name; the examples set theirs in code |
 
-`x/tunnel` is a preview (0.x) module; its API may change in a minor release.
+Values come from your Restate Cloud environment. `x/tunnel` is a preview (0.x) module; its
+API and variables may change in a minor release.
 
 ## License
 

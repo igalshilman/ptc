@@ -18,16 +18,17 @@
 //   - The two RESTATE PRIMITIVES that aren't just handler calls, as static tools:
 //     sleep (durable timer) and signal (create + await a named external signal).
 //
-//     OPENAI_API_KEY=sk-...  go run ./examples/orchestrator   # serves on :9080
+//     OPENAI_API_KEY=sk-...  go run ./examples/orchestrator
 //
-// The back-office is NOT co-deployed here — run ./examples/backoffice as its own
-// deployment and register both with your Restate runtime. Discovery runs LAZILY on each
-// Ask (journaled for replay), not at startup, so it doesn't matter which deployment
-// registers first, and new annotated services deployed between turns are picked up on
-// the next Ask.
+// It connects to Restate Cloud through an outbound tunnel (agent.Serve → agent.Deploy);
+// the back-office runs as its own tunneled deployment (./examples/backoffice). Discovery
+// runs LAZILY on each Ask (journaled for replay), not at startup, so it doesn't matter
+// which deployment registers first, and new annotated services are picked up on the next
+// Ask.
 //
-// Env: RESTATE_ADMIN_URL (default http://localhost:9070), AGENT_ADDR (default :9080),
-// AGENT_MODEL (default gpt-5), OPENAI_BASE_URL, OPENAI_API_KEY (required).
+// Env: RESTATE_ADMIN_URL (default http://localhost:9070), AGENT_MODEL (default gpt-5),
+// OPENAI_BASE_URL, OPENAI_API_KEY (required), plus the tunnel's RESTATE_INPROC_* vars
+// (see the README's "Deploying through a tunnel").
 package main
 
 import (
@@ -62,6 +63,6 @@ func main() {
 	}
 	defer svc.Close(ctx)
 
-	// Bind the agent's Restate definitions and serve on AGENT_ADDR (default :9080).
+	// Bind the agent's Restate definitions and connect to Restate Cloud via the tunnel.
 	agent.Serve(ctx, svc)
 }
