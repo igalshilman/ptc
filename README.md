@@ -306,7 +306,7 @@ invariants.
 ## Deploying through a tunnel
 
 Each deployment connects **outbound** to Restate Cloud through
-[`github.com/restatedev/sdk-go/x/tunnel`](https://github.com/restatedev/sdk-go/releases/tag/x/tunnel/v0.1.0),
+[`github.com/restatedev/sdk-go/x/tunnel`](https://github.com/restatedev/sdk-go/releases/tag/x/tunnel/v0.1.1),
 so it needs no inbound listener or public URL. `agent.Deploy(ctx, tunnelName, defs...)`
 binds the given service definitions and sets only the tunnel **name** from its argument
 (the examples pass `agent` and `backoffice`, so the two can be co-deployed without

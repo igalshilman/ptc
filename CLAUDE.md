@@ -344,7 +344,7 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
 ## Dependencies (all published; no replace)
 - `github.com/restatedev/sdk-go v1.0.2` (Restate Go SDK; the ordered WaitIterator that
   makes the `Promise.race` winner replay-stable landed in v1.0.1 — see the race caveat)
-- `github.com/restatedev/sdk-go/x/tunnel v0.1.0` (preview; outbound Restate Cloud tunnel
+- `github.com/restatedev/sdk-go/x/tunnel v0.1.1` (preview; outbound Restate Cloud tunnel
   used by `agent.Deploy` to connect outbound to Restate Cloud)
 - `github.com/tetratelabs/wazero v1.9.0` (pure-Go WASM runtime; NO cgo — chosen
   over wasmer-go which is cgo + unmaintained)
