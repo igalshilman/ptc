@@ -86,7 +86,8 @@ Env vars: `AGENT_MODEL` (default `gpt-5`; the project's key also has
 gpt-5-mini/nano/gpt-5.1/gpt-5.2 — gpt-5 works via plain Chat Completions, no special
 params), `OPENAI_API_KEY` (REQUIRED — `ClientFromEnv` fails at boot if unset; use `dummy`
 for a keyless local endpoint), `OPENAI_BASE_URL` (optional; any OpenAI-compatible
-endpoint). The orchestrator also reads `RESTATE_ADMIN_URL` for handler discovery.
+endpoint). The orchestrator also reads `RESTATE_ADMIN_URL` (+ `RESTATE_AUTH_TOKEN` as the
+Admin-API bearer) for handler discovery.
 
 **Deploy (`agent.Deploy(ctx, tunnelName, defs...)` in serve.go, used by BOTH examples):**
 always connects OUTBOUND to Restate Cloud via `github.com/restatedev/sdk-go/x/tunnel` — no
@@ -206,7 +207,10 @@ Agent/<session>/Ask handler  →  RunAgent loop   (plain Go loop, NOT a restate.
   uses it) when the target services register independently of the agent — a separate
   deployment, or one co-deployed but not visible until after startup — since it is
   order-independent and picks up services registered between turns. The annotation value,
-  if non-empty, becomes the tool name (sanitized to a JS identifier).
+  if non-empty, becomes the tool name (sanitized to a JS identifier). `DiscoverConfig`
+  carries the `AdminURL` and an optional `AuthToken` sent as `Authorization: Bearer` —
+  REQUIRED against Restate Cloud, whose Admin API (`https://<env>.env.<region>.restate.cloud:9070`)
+  rejects unauthenticated requests; the orchestrator passes `RESTATE_AUTH_TOKEN`.
 - **Named signals (`AgentSignals`):** `agent.Signal[R](ctx, name)` blocks a leaf tool on
   a named signal on the current invocation. The framework binds a keyless `AgentSignals`
   service whose `resolve` / `reject` handlers complete a signal by `(invocation, name)`;

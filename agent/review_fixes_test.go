@@ -5,12 +5,46 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	restate "github.com/restatedev/sdk-go"
 )
+
+// TestDiscoveryAuthHeader guards Admin-API discovery auth: fetchServices sends
+// "Authorization: Bearer <token>" when DiscoverConfig.AuthToken is set (Restate Cloud
+// requires it) and no auth header when it is empty.
+func TestDiscoveryAuthHeader(t *testing.T) {
+	var gotAuth, gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotPath = r.URL.Path
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"services":[]}`))
+	}))
+	defer srv.Close()
+
+	if _, err := fetchServices(context.Background(), srv.URL, "tok-123"); err != nil {
+		t.Fatalf("fetchServices with token: %v", err)
+	}
+	if gotAuth != "Bearer tok-123" {
+		t.Fatalf("Authorization = %q, want %q", gotAuth, "Bearer tok-123")
+	}
+	if gotPath != "/services" {
+		t.Fatalf("path = %q, want /services", gotPath)
+	}
+
+	gotAuth = "unset"
+	if _, err := fetchServices(context.Background(), srv.URL, ""); err != nil {
+		t.Fatalf("fetchServices without token: %v", err)
+	}
+	if gotAuth != "" {
+		t.Fatalf("Authorization = %q, want empty when no token", gotAuth)
+	}
+}
 
 // TestNonSerializableReturnIsRecoverable guards F5: a program whose RETURN value cannot
 // be JSON-serialized (BigInt, circular object) must surface as a NON-terminal program

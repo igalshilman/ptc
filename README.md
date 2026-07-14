@@ -82,7 +82,7 @@ make guest-rs
 | `OPENAI_API_KEY` | required | OpenAI credential; use `dummy` for a keyless local endpoint |
 | `OPENAI_BASE_URL` | OpenAI | OpenAI-compatible API endpoint |
 | `AGENT_MODEL` | `gpt-5` | model used by the orchestrator |
-| `RESTATE_ADMIN_URL` | `http://localhost:9070` | Restate Admin API used for handler discovery |
+| `RESTATE_ADMIN_URL` | `http://localhost:9070` | Restate Admin API for handler discovery; on Restate Cloud, your environment's admin URL, authorized with `RESTATE_AUTH_TOKEN` |
 
 Both deployments connect to Restate Cloud through an outbound tunnel; that needs a few
 more variables — see [Deploying through a tunnel](#deploying-through-a-tunnel).
@@ -320,6 +320,9 @@ export RESTATE_INPROC_ENVIRONMENT_ID=env_...              # Restate Cloud enviro
 export RESTATE_AUTH_TOKEN=...                             # Restate Cloud API token
 export RESTATE_INPROC_SIGNING_PUBLIC_KEY=publickeyv1_...  # environment signing public key
 export RESTATE_TUNNEL_SERVERS_SRV=tunnel.us.restate.cloud # regional tunnel servers (SRV)
+
+# the agent also discovers handlers over the Admin API — authorized with RESTATE_AUTH_TOKEN:
+export RESTATE_ADMIN_URL=https://<env>.env.us.restate.cloud:9070
 
 OPENAI_API_KEY=sk-... go run ./examples/orchestrator     # tunnel name: agent
 OPENAI_API_KEY=sk-... go run ./examples/backoffice       # tunnel name: backoffice

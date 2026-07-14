@@ -17,9 +17,10 @@ import (
 // deployment's durable handlers (in parallel, durably) via generated code. Only
 // handlers ANNOTATED with AgentToolAnnotation are exposed (opt-in).
 type DiscoverConfig struct {
-	AdminURL string   // Restate Admin API base URL (default http://localhost:9070)
-	Allow    []string // if non-empty, only these service names become tools
-	Deny     []string // service names to skip (the Agent session object is always skipped)
+	AdminURL  string   // Restate Admin API base URL (default http://localhost:9070)
+	AuthToken string   // if set, sent as "Authorization: Bearer <token>" (required by Restate Cloud)
+	Allow     []string // if non-empty, only these service names become tools
+	Deny      []string // service names to skip (the Agent session object is always skipped)
 }
 
 // AgentToolAnnotation is the handler-metadata key that opts a handler in to agent
@@ -69,7 +70,7 @@ type handlerDescriptor struct {
 // filtering). This is the non-deterministic part; keep it pure of Tool construction
 // so callers can journal the descriptors.
 func fetchHandlers(ctx context.Context, cfg DiscoverConfig) ([]handlerDescriptor, error) {
-	svcs, err := fetchServices(ctx, cfg.AdminURL)
+	svcs, err := fetchServices(ctx, cfg.AdminURL, cfg.AuthToken)
 	if err != nil {
 		return nil, err
 	}
@@ -132,7 +133,7 @@ type adminHandler struct {
 	OutputJSONSchema json.RawMessage   `json:"output_json_schema"`
 }
 
-func fetchServices(ctx context.Context, adminURL string) ([]adminService, error) {
+func fetchServices(ctx context.Context, adminURL, authToken string) ([]adminService, error) {
 	if strings.TrimSpace(adminURL) == "" {
 		adminURL = defaultAdminURL
 	}
@@ -142,6 +143,9 @@ func fetchServices(ctx context.Context, adminURL string) ([]adminService, error)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("admin discovery: %w", err)
+	}
+	if t := strings.TrimSpace(authToken); t != "" {
+		req.Header.Set("Authorization", "Bearer "+t) // Restate Cloud requires it
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

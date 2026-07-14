@@ -55,8 +55,12 @@ func main() {
 		// The two primitives that aren't just handler calls (durable timer + named signal).
 		Tools: []agent.Tool{sleepTool(), signalTool()},
 		// Discover annotated handlers (the back-office deployment + the framework's
-		// AgentSignals service) from the Admin API, lazily, per Ask.
-		Discover: &agent.DiscoverConfig{AdminURL: os.Getenv("RESTATE_ADMIN_URL")},
+		// AgentSignals service) from the Admin API, lazily, per Ask. On Restate Cloud the
+		// Admin API needs a bearer token (the same RESTATE_AUTH_TOKEN the tunnel uses).
+		Discover: &agent.DiscoverConfig{
+			AdminURL:  os.Getenv("RESTATE_ADMIN_URL"),
+			AuthToken: os.Getenv("RESTATE_AUTH_TOKEN"),
+		},
 	})
 	if err != nil {
 		log.Fatalf("orchestrator: build service: %v", err)
