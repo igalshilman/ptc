@@ -82,7 +82,7 @@ make guest-rs
 | `OPENAI_API_KEY` | required | OpenAI credential; use `dummy` for a keyless local endpoint |
 | `OPENAI_BASE_URL` | OpenAI | OpenAI-compatible API endpoint |
 | `AGENT_MODEL` | `gpt-5` | model used by the orchestrator |
-| `RESTATE_ADMIN_URL` | Admin API | Restate Admin API used for handler discovery |
+| `RESTATE_ADMIN_URL` | `http://localhost:9070` | Restate Admin API used for handler discovery |
 
 Both deployments connect to Restate Cloud through an outbound tunnel; that needs a few
 more variables — see [Deploying through a tunnel](#deploying-through-a-tunnel).
@@ -190,9 +190,10 @@ or cancel the work".
 
 ## Handler discovery
 
-Any Restate handler can opt into discovery with metadata named `restate/agent`.
-The metadata value becomes the tool name. The agent reads the handler's input and
-output schemas from the Restate Admin API and builds a callable tool for the
+A Restate handler opts into discovery by carrying metadata keyed `restate/agent`.
+Its value, when non-empty, becomes the tool name (sanitized to a JS identifier);
+otherwise the tool is named `<Service>_<handler>`. The agent reads the handler's input
+and output schemas from the Restate Admin API and builds a callable tool for the
 current turn.
 
 In Go:
@@ -306,15 +307,15 @@ invariants.
 
 Each deployment connects **outbound** to Restate Cloud through
 [`github.com/restatedev/sdk-go/x/tunnel`](https://github.com/restatedev/sdk-go/releases/tag/x/tunnel/v0.1.0),
-so it needs no inbound listener or public URL. `agent.Deploy(ctx, srv, tunnelName)` sets
-only the tunnel **name** from its argument (the examples pass `agent` and `backoffice`, so
-the two can be co-deployed without colliding); the tunnel reads everything else from the
-environment (the variables the Restate operator injects for in-process tunnel mode).
+so it needs no inbound listener or public URL. `agent.Deploy(ctx, tunnelName, defs...)`
+binds the given service definitions and sets only the tunnel **name** from its argument
+(the examples pass `agent` and `backoffice`, so the two can be co-deployed without
+colliding); the tunnel reads everything else from the environment (the variables the
+Restate operator injects for in-process tunnel mode).
 
 Set the tunnel environment, then run either example:
 
 ```bash
-export RESTATE_TUNNEL=1
 export RESTATE_INPROC_ENVIRONMENT_ID=env_...              # Restate Cloud environment id
 export RESTATE_AUTH_TOKEN=...                             # Restate Cloud API token
 export RESTATE_INPROC_SIGNING_PUBLIC_KEY=publickeyv1_...  # environment signing public key
@@ -326,7 +327,6 @@ OPENAI_API_KEY=sk-... go run ./examples/backoffice       # tunnel name: backoffi
 
 | Variable | Purpose |
 |---|---|
-| `RESTATE_TUNNEL` | selects in-process tunnel mode |
 | `RESTATE_INPROC_ENVIRONMENT_ID` | Restate Cloud environment id (`env_…`) |
 | `RESTATE_AUTH_TOKEN` | Restate Cloud API token (or `RESTATE_INPROC_AUTH_TOKEN_FILE` to read it from a file) |
 | `RESTATE_INPROC_SIGNING_PUBLIC_KEY` | environment signing public key (`publickeyv1_…`) |

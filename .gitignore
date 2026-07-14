@@ -3,6 +3,8 @@
 
 # Local env / secrets
 .env
+# Personal tunnel run script (holds a specific Restate Cloud environment's config)
+/run.sh
 
 # OS / editor cruft
 .DS_Store
